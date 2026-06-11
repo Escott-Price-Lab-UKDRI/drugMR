@@ -28,7 +28,11 @@ set -euo pipefail
 if [ -d "$HOME/drugMR" ]; then
     echo "[TRACKING] I found the directory!"
     cd "$HOME/drugMR"
-    git pull
+
+    echo "[TRACKING] Resetting Falcon repo to GitHub main..."
+    git fetch origin main
+    git reset --hard origin/main
+    git clean -fd
 else
     echo "[CONCERN] Yowza! I cannot see the drugMR directory..."
     echo "[TRACKING] Cloning from GitHub..."
@@ -45,7 +49,7 @@ if [ ! -d "$HOME/drugMR" ]; then
 fi
 
 cd "$HOME/drugMR"
-git pull
+# git pull
 
 chmod +x bin/bootstrap_hpc.sh
 bash bin/bootstrap_hpc.sh
@@ -231,3 +235,93 @@ ls -lh results/cis-MR/
 head -5 "{mr_res}"
 """, falcon_user)
 
+
+
+# Function to run all the HPC gist
+def run(
+    falcon_user: str,
+    pheno_id: str,
+    sumstats: str,
+    n_cases: int,
+    n_controls: int,
+    pqtl_dataset: str,
+    pqtl_dir: str,
+    ref_bfile: str,
+    snp_col: str,
+    a1_col: str,
+    a2_col: str,
+    beta_col: str,
+    se_col: str,
+    p_col: str,
+    pos_col: str,
+    chr_col: str,
+    af_col: str,
+    genome_build: str,
+    out_dir: str = "results",
+    maf: float = 0.01,
+    info_threshold: float | None = None,
+    info_col: str | None = None,
+    remove_mhc: bool = True,
+    remove_apoe: bool = False,
+    local_results_dir: str = "../results/cis-MR",
+    overwrite: bool = True,
+):
+
+    print("[TRACKING] Preparing Falcon repo...")
+    clone_repo(falcon_user)
+
+    print("[TRACKING] Preparing Falcon env...")
+    container_checks(falcon_user)
+
+    print("[TRACKING] Running GWAS QC...")
+    run_gwas_qc(
+        falcon_user=falcon_user,
+        pheno_id=pheno_id,
+        sumstats=sumstats,
+        out_dir=out_dir,
+        snp_col=snp_col,
+        a1_col=a1_col,
+        a2_col=a2_col,
+        beta_col=beta_col,
+        se_col=se_col,
+        p_col=p_col,
+        pos_col=pos_col,
+        chr_col=chr_col,
+        af_col=af_col,
+        genome_build=genome_build,
+        n_cases=n_cases,
+        n_controls=n_controls,
+        maf=maf,
+        info_threshold=info_threshold,
+        info_col=info_col,
+        remove_mhc=remove_mhc,
+        remove_apoe=remove_apoe,
+    )
+
+    print("[TRACKING] Running cis-MR...")
+    run_cis_mr(
+        falcon_user=falcon_user,
+        pqtl_dataset=pqtl_dataset,
+        pqtl_dir=pqtl_dir,
+        pheno_id=pheno_id,
+        pheno_gwas=f"results/QC/{pheno_id}/{pheno_id}.tsv",
+        ref_bfile=ref_bfile,
+    )
+
+    print("[TRACKING] Checking outputs...")
+    check_outputs(
+        falcon_user=falcon_user,
+        pqtl_dataset=pqtl_dataset,
+        pheno_id=pheno_id,
+    )
+
+    print("[TRACKING] Pulling results locally...")
+    pull_results_local(
+        falcon_user=falcon_user,
+        pqtl_dataset=pqtl_dataset,
+        pheno_id=pheno_id,
+        local_results_dir=local_results_dir,
+        overwrite=overwrite,
+    )
+
+    print("[DONE] drugMR pipeline completed successfully.")
