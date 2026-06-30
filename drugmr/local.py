@@ -26,6 +26,7 @@ def results(
 ):
     project_root = Path(__file__).resolve().parents[1]
     mr_res = project_root / "results" / "cis-MR" / f"{pqtl_dataset}_{pheno_id}_all_MR.tsv"
+    coloc_res = project_root / "results" / "coloc" / pqtl_dataset / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     db_script = project_root / db_script
     dashboard_script = project_root / dashboard_script
 
@@ -35,7 +36,7 @@ def results(
         [
             sys.executable,
             str(db_script),
-            "--mr_res",
+            "--results_file",
             str(mr_res),
             "--db_id",
             db_id,
@@ -43,6 +44,28 @@ def results(
             pqtl_dataset,
             "--pheno_id",
             pheno_id,
+            "--table",
+            "cis_mr_results",
+        ],
+        check=True,
+    )
+
+    print("[TRACKING] Loading COLOC results into PostgreSQL...")
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(db_script),
+            "--results_file",
+            str(coloc_res),
+            "--db_id",
+            db_id,
+            "--pqtl_dataset",
+            pqtl_dataset,
+            "--pheno_id",
+            pheno_id,
+            "--table",
+            "coloc_results",
         ],
         check=True,
     )
@@ -92,6 +115,7 @@ def local(
     chr_col: str,
     af_col: str,
     genome_build: str,
+    target_build: str,
     out_dir: str = "results", # default dir in ./results within drugmR/
     maf: float = 0.01, # set default at 0.01 
     info_threshold: float | None = None,
@@ -172,6 +196,7 @@ docker run --rm \\
     --chr-col {chr_col} \\
     --af_col {af_col} \\
     --genome_build {genome_build} \\
+    --target_build {target_build} \\
     --n_cases {n_cases} \\
     --n_controls {n_controls} \\
     --falcon-user local \\
@@ -181,7 +206,7 @@ docker run --rm \\
     cmd_base(cmd_qc)
 
     # cis-MR module 
-    print("[TRACKING] Running cos-MR locally via Docker...")
+    print("[TRACKING] Running cis-MR locally via Docker...")
 
     cmd_mr = f"""
 set -euo pipefail

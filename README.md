@@ -1,6 +1,6 @@
 # cis-MR pipeline
 
-Plasma proteins and CSF pQTLs from UKBB-PPP, NIAGADS and bulk brain sources for Alzheimer's disease drug discovery. End-to-end pipeline (local+cloud hybrid) from raw GWAS and pQTL data to a production-ready dashboard.
+Plasma proteins pQTLs from UKBB-PPP and deCODE sources for Alzheimer's disease drug discovery. End-to-end pipeline (local+cloud hybrid) from raw GWAS and pQTL data to a production-ready dashboard.
 
 ---
 
@@ -9,6 +9,25 @@ Plasma proteins and CSF pQTLs from UKBB-PPP, NIAGADS and bulk brain sources for 
 ```bash
 git clone https://github.com/guillermocomesanacimadevila/drugMR.git
 cd drugMR/
+```
+
+## Synapse configuration
+
+Create the Synapse config file:
+
+```bash
+nano ~/.synapseConfig
+```
+
+Populate it with your Synapse info!
+
+```bash
+[default]
+username = your_email@example.com
+authtoken = YOUR_PERSONAL_ACCESS_TOKEN
+
+[cache]
+location = ~/.synapseCache
 ```
 
 ## Streamlit configuration
