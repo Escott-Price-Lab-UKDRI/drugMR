@@ -216,6 +216,40 @@ def local(config: str = "assets/config.yaml"):
         / f"{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
     )
 
+    # coloc and moloc with multi-omics
+    prepared_multi_omics_out = project_root / "results" / "SMR" / eqtl_dataset / pheno_id / f"{pqtl_dataset}_{pheno_id}_prepared_multi_omics_targets.tsv"
+    eqtl_coloc_out = project_root / "results" / "eQTL_coloc" / pqtl_dataset / eqtl_dataset / pheno_id / f"{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_all_eqtl_coloc.tsv"
+    moloc_out = project_root / "results" / "QTL_moloc" / pqtl_dataset / eqtl_dataset / pheno_id / f"{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_moloc_summary.tsv"
+
+    # FINAL TABLE (NO MEDIATORS)
+    summary_out = (
+        project_root
+        / "results"
+        / "SMR"
+        / eqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_multi_omics_overview.tsv"
+    )
+
+    snp_evidence_out = (
+        project_root
+        / "results"
+        / "SMR"
+        / eqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_multi_omics_snp_evidence.tsv"
+    )
+
+    # phewas - ukb_ppp_AD_PheWAS.tsv
+    phewas_out = (
+        project_root
+        / "results"
+        / "PheWAS"
+        / pqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
+    )
+    
     # change this where NetworkMR saves its final compiled output
     network_mr_out = (
         project_root
@@ -507,4 +541,101 @@ docker run --rm \\
     else:
         print(f"[CONCERN] Final multi-omics target file not found or empty: {final_smr_out}")
 
+        # ------ -------------------- ------
+    # Multi-omics QTL colocalisation
+    # GWAS - sc-eQTL pairwise coloc
+    # GWAS - pQTL - sc-eQTL MOLOC
+    # ------ -------------------- ------
+
+    require_output(final_smr_out, "single-cell SMR", "multi-omics QTL colocalisation")
+
+    cmd_multi_omics_coloc = f"""
+set -euo pipefail
+docker run --rm \\
+  --platform linux/amd64 \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/assort_moloc_for_sc_hits.py \\
+    --pheno_id {pheno_id} \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {eqtl_dataset} \\
+    --n_cases {n_cases} \\
+    --n_controls {n_controls}
+"""
+
+    multi_omics_complete = (
+        prepared_multi_omics_out.exists() and prepared_multi_omics_out.stat().st_size > 0
+        and eqtl_coloc_out.exists() and eqtl_coloc_out.stat().st_size > 0
+        and moloc_out.exists() and moloc_out.stat().st_size > 0
+    )
+
+    if overwrite or not multi_omics_complete:
+        print("[TRACKING] Running multi-omics QTL colocalisation locally...")
+        cmd_base(cmd_multi_omics_coloc)
+    else:
+        print("[TRACKING] Multi-omics QTL colocalisation already completed.")
+        print("[TRACKING] Skipping multi-omics QTL colocalisation...")
+
+    require_output(prepared_multi_omics_out, "multi-omics target preparation", "pipeline completion")
+    require_output(eqtl_coloc_out, "GWAS - sc-eQTL COLOC", "pipeline completion")
+    require_output(moloc_out, "GWAS - pQTL - sc-eQTL MOLOC", "pipeline completion")
+    print(f"[TRACKING] Prepared multi-omics target manifest found: {prepared_multi_omics_out}")
+    print(f"[TRACKING] GWAS - sc-eQTL COLOC results found: {eqtl_coloc_out}")
+    print(f"[TRACKING] GWAS - pQTL - sc-eQTL MOLOC results found: {moloc_out}")
+
+    # compile (for top SMR SNP and top pQTL SNP)
+    cmd_summary = f"""
+set -euo pipefail
+docker run --rm \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/summarise_multi_omics.py \\
+    --pheno_id {pheno_id} \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {eqtl_dataset}
+"""
+    
+    require_output(prepared_multi_omics_out, "multi-omics target preparation", "final summary")
+    require_output(eqtl_coloc_out, "GWAS - sc-eQTL COLOC", "final summary")
+    require_output(moloc_out, "GWAS - pQTL - sc-eQTL MOLOC", "final summary")
+    summary_complete = (check_output(summary_out, "multi-omics overview", overwrite) and check_output(snp_evidence_out, "multi-omics SNP evidence", overwrite))
+    if not summary_complete:
+        print("[TRACKING] Building final dashboard-ready multi-omics tables...")
+        cmd_base(cmd_summary)
+
+    require_output(summary_out, "multi-omics overview", "pipeline completion")
+    require_output(snp_evidence_out, "multi-omics SNP evidence", "pipeline completion")
+    print(f"[TRACKING] Multi-omics overview found: {summary_out}")
+    print(f"[TRACKING] SNP evidence table found: {snp_evidence_out}")
+
+
+        # PheWAS stuff
+    cmd_phewas = f"""
+set -euo pipefail 
+docker run --rm \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/phewas_cis_pqtls.py \\
+    --pheno_id {pheno_id} \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {eqtl_dataset}
+"""
+
+    # PheWAS depends on the final multi-omics target results
+    require_output(summary_out, "multi-omics overview", "PheWAS")
+    require_output(snp_evidence_out, "multi-omics SNP evidence", "PheWAS")
+
+    if not check_output(phewas_out, "PheWAS safety analysis", overwrite):
+        print("[TRACKING] Running PheWAS safety analysis locally...")
+        cmd_base(cmd_phewas)
+
+    require_output(phewas_out, "PheWAS safety analysis", "pipeline completion")
+    print(f"[TRACKING] PheWAS safety results found: {phewas_out}")
+    
     print("[DONE] Local Docker run completed.")
