@@ -5,23 +5,26 @@ from pathlib import Path
 import os
 from drugmr import COJO
 
-def cojo_on_pqtl_loci(ref_bfile: str, eqtl_dataset: str, pqtl_dataset: str, pheno_id: str):
+def cojo_on_pqtl_loci(ref_bfile: str, pqtl_dataset: str, pheno_id: str):
     
     """
-    1. Check proteins that surpass all cis-MR + COLOC + SMR + QTL MOLOC/COLOC thresholds for pQTL dataset X
-    2. If target == true -> Reformat pqtl.parquet in cis-regions/ to COJO and store as temp in work/COJO
+    1. Check proteins within pairwise pQTL-GWAS COLOC results for pQTL dataset X
+    2. Reformat pqtl.parquet in cis-regions/ to COJO and store as temp in work/COJO
     3. Align all pQTL effects to outcome GWAS A1
     4. Run COJO
     """
 
-    # ukb_ppp_AD_multi_omics_snp_evidence.tsv
-    res_file = f"./results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_multi_omics_snp_evidence.tsv"
+    # all proteins in this file have already passed cis-MR + COLOC thresholds
+    res_file = f"./results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     df = pl.read_csv(res_file, separator="\t")
+    # coloc.R names the protein column protein_id
+    if "protein_id" in df.columns:
+        df = df.rename({"protein_id": "protein"})
+    print(f"[TRACKING] Proteins available for COJO: {df.height}")
     temp_out_path = f"./work/COJO/{pqtl_dataset}/{pheno_id}"
     temp_out_path = Path(temp_out_path)
     os.makedirs(temp_out_path, exist_ok=True)
     # bare in mind top SNP
-    df = (df.filter(pl.col("snp_type") == "Lead pQTL SNP").unique(subset=["protein"], keep="first"))
     for row in df.iter_rows(named=True):
         target = row["protein"]
         pth = f"./dat/cis_regions/{pqtl_dataset}/{target}"
@@ -40,18 +43,8 @@ def cojo_on_pqtl_loci(ref_bfile: str, eqtl_dataset: str, pqtl_dataset: str, phen
         print(f"Loaded {gwas.height:,} GWAS SNPs")
         print("GWAS columns:", gwas.columns)
         # standardise allele columns
-        cis = cis.with_columns(pl.col("SNP").cast(pl.Utf8), pl.col("A1").cast(pl.Utf8).str.to_uppercase(), pl.col("A2").cast(pl.Utf8).str.to_uppercase(),)
-        gwas = (
-            gwas
-            .select(
-                pl.col("SNP").cast(pl.Utf8),
-                pl.col("A1").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A1"),
-                pl.col("A2").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A2"),
-                pl.col("BETA").alias("GWAS_BETA"),
-            )
-            .unique(subset=["SNP"], keep="first")
-        )
-
+        cis = cis.with_columns(pl.col("SNP").cast(pl.Utf8), pl.col("A1").cast(pl.Utf8).str.to_uppercase(), pl.col("A2").cast(pl.Utf8).str.to_uppercase())
+        gwas = (gwas.select(pl.col("SNP").cast(pl.Utf8), pl.col("A1").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A1"), pl.col("A2").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A2"), pl.col("BETA").alias("GWAS_BETA")).unique(subset=["SNP"], keep="first"))
         # match pQTL SNPs against outcome GWAS SNPs
         cis = cis.join(gwas, on="SNP", how="inner")
         print(f"Retained {cis.height:,} SNPs present in both pQTL and GWAS files")
@@ -120,7 +113,7 @@ def cojo_on_pqtl_loci(ref_bfile: str, eqtl_dataset: str, pqtl_dataset: str, phen
         )
 
         # check the lead SNP alignment
-        lead_snp = row["SNP"]
+        lead_snp = row["top_snp"]
         lead_snp_check = (
             cis
             .filter(pl.col("SNP") == lead_snp)
@@ -168,21 +161,32 @@ def cojo_on_pqtl_loci(ref_bfile: str, eqtl_dataset: str, pqtl_dataset: str, phen
         )
         # results/COJO/ukb_ppp/AD/BLNK_Q8WV28/BLNK_Q8WV28.jma.cojo
 
+        # now check COJO output for independent signals
+        cojo_max_signals = 10
+        mr_instruments_file = Path(f"./results/cis-MR/instruments/{pqtl_dataset}_{pheno_id}_all_MR_instruments.tsv")
+        mr_instruments = pl.read_csv(mr_instruments_file, separator="\t", schema_overrides={"protein": pl.Utf8, "SNP": pl.Utf8})
+        cojo_results_file = Path(f"{out_prefix}.jma.cojo")
+        cojo_results = pl.read_csv(cojo_results_file, separator="\t", schema_overrides={"SNP": pl.Utf8})
+        n_signals = cojo_results.height
+        print(f"[TRACKING] COJO selected {n_signals} independent signal(s) for {target}")
+        if n_signals > cojo_max_signals:
+            print(f"[CONCERN] {target} has {n_signals} COJO signals (> {cojo_max_signals}). Keeping only SNPs used in cis-MR.")
+            target_mr_snps = mr_instruments.filter(pl.col("protein") == target).select("SNP").unique()
+            cojo_results = cojo_results.join(target_mr_snps, on="SNP", how="semi")
+            cojo_results.write_csv(cojo_results_file, separator="\t")
+            print(f"[TRACKING] Overwrote {cojo_results_file} with {cojo_results.height} COJO rows matching cis-MR instruments")
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--pheno_id", required=True)
     p.add_argument("--pqtl_dataset", required=True)
-    p.add_argument("--eqtl_dataset", required=True)
     p.add_argument("--ref_bfile", required=True)
     args = p.parse_args()
     cojo_on_pqtl_loci(
         ref_bfile=args.ref_bfile,
         pqtl_dataset=args.pqtl_dataset,
-        eqtl_dataset=args.eqtl_dataset,
         pheno_id=args.pheno_id,
     )
-
 
 if __name__ == "__main__":
     main()
