@@ -93,40 +93,6 @@ exit 3
     print("[TRACKING] No complete cis-region output found - running step...")
     return False
 
-def check_remote_cojo(
-    falcon_user: str,
-    pqtl_dataset: str,
-    pheno_id: str,
-    overwrite: bool = False
-):
-    # run step if overwrite == True
-    if overwrite:
-        print("[TRACKING] Overwrite enabled - rerunning GCTA-COJO...")
-        return False
-
-    remote, _ = get_remote_paths(falcon_user)
-
-    result = ssh(f"""
-set -euo pipefail
-cd "{remote}"
-
-n_cojo=$(find "results/COJO/{pqtl_dataset}/{pheno_id}" -mindepth 2 -maxdepth 2 -name "*.jma.cojo" -size +0c 2>/dev/null | wc -l)
-
-if [ "$n_cojo" -gt 0 ]; then
-    echo "[TRACKING] GCTA-COJO already completed: $n_cojo loci found"
-    exit 0
-fi
-
-exit 3
-""", falcon_user, allowed_returncodes=(0, 3))
-
-    if result.returncode == 0:
-        print("[TRACKING] Skipping GCTA-COJO...")
-        return True
-
-    print("[TRACKING] No complete GCTA-COJO outputs found - running step...")
-    return False
-
 def require_remote_output(
     falcon_user: str,
     path: str,
@@ -432,92 +398,11 @@ apptainer exec --bind "{remote}:/work" \\
     --mediator_manifest {mediator_manifest}"
 """, falcon_user)
 
-
-# def run_smr(
-#         falcon_user: str, 
-#         pqtl_dataset: str,
-#         pheno_id: str,
-# ):
-
-def run_smr(
-    falcon_user: str,
-    pqtl_dataset: str, 
-    pheno_id: str,
-    eqtl_dataset: str,
-    sumstats: str,
-    ref_bfile: str,
-    maf: float
-):
-    remote, sif = get_remote_paths(falcon_user)
-
-    ssh(f"""
-set -euo pipefail 
-cd "{remote}"
-
-apptainer exec --bind "{remote}:/work" \\
-  --env PYTHONPATH=. \\
-  "{sif}" \\
-  bash -c "cd /work && python bin/sort_single_cell_smr.py \\
-    --pqtl_dataset {pqtl_dataset} \\
-    --pheno_id {pheno_id} \\
-    --eqtl_dataset {eqtl_dataset} \\
-    --sumstats {sumstats} \\
-    --maf {maf} \\
-    --ref_bfile {ref_bfile}"
-""", falcon_user)
-
-
-def run_multi_omics_coloc(
+# get final snp-wide hits 
+def compile_top_hits(
     falcon_user: str,
     pheno_id: str,
     pqtl_dataset: str,
-    eqtl_dataset: str,
-    n_cases: int,
-    n_controls: int
-):
-    remote, sif = get_remote_paths(falcon_user)
-
-    ssh(f"""
-set -euo pipefail
-cd "{remote}"
-
-apptainer exec --bind "{remote}:/work" \\
-  --env PYTHONPATH=. \\
-  "{sif}" \\
-  bash -c "cd /work && python bin/assort_moloc_for_sc_hits.py \\
-    --pheno_id {pheno_id} \\
-    --pqtl_dataset {pqtl_dataset} \\
-    --eqtl_dataset {eqtl_dataset} \\
-    --n_cases {n_cases} \\
-    --n_controls {n_controls}"
-""", falcon_user)
-
-def run_multi_omics_summary(
-    falcon_user: str,
-    pheno_id: str,
-    pqtl_dataset: str,
-    eqtl_dataset: str
-):
-    remote, sif = get_remote_paths(falcon_user)
-
-    ssh(f"""
-set -euo pipefail
-cd "{remote}"
-apptainer exec --bind "{remote}:/work" \\
-  --env PYTHONPATH=. \\
-  "{sif}" \\
-  bash -c "cd /work && python bin/summarise_multi_omics.py \\
-    --pheno_id {pheno_id} \\
-    --pqtl_dataset {pqtl_dataset} \\
-    --eqtl_dataset {eqtl_dataset}"
-""", falcon_user)
-
-def run_cojo(
-    falcon_user: str,
-    pheno_id: str,
-    pqtl_dataset: str,
-    eqtl_dataset: str,
-    ref_bfile: str,
 ):
     remote, sif = get_remote_paths(falcon_user)
 
@@ -528,11 +413,9 @@ cd "{remote}"
 apptainer exec --bind "{remote}:/work" \\
   --env PYTHONPATH=/work \\
   "{sif}" \\
-  bash -c "cd /work && python bin/cojo_on_pqtls.py \\
+  bash -c "cd /work && python bin/compile_cis_hit_info.py \\
     --pheno_id {pheno_id} \\
-    --pqtl_dataset {pqtl_dataset} \\
-    --eqtl_dataset {eqtl_dataset} \\
-    --ref_bfile {ref_bfile}"
+    --pqtl_dataset {pqtl_dataset}"
 """, falcon_user)
 
 # RUN PHEWAS CHECKS FOR SAFETY (LOCALLY) -> API != WORK IN SLURM HPC
@@ -541,7 +424,6 @@ apptainer exec --bind "{remote}:/work" \\
 def phewas_safety(
     pheno_id: str,
     pqtl_dataset: str,
-    eqtl_dataset: str,
     local_results_dir: str = "results",
     overwrite: bool = False
 ):
@@ -553,10 +435,9 @@ def phewas_safety(
 
     top_snp_file = (
         local_results_dir
-        / "SMR"
-        / eqtl_dataset
-        / pheno_id
-        / f"{pqtl_dataset}_{pheno_id}_multi_omics_snp_evidence.tsv"
+        / "coloc"
+        / pqtl_dataset
+        / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     )
 
     phewas_out = (
@@ -577,6 +458,16 @@ def phewas_safety(
     else:
         print("[TRACKING] No existing PheWAS safety output found - running step...")
 
+    if not top_snp_file.exists():
+        raise FileNotFoundError(
+            f"PheWAS cannot run because pairwise COLOC output was not found: {top_snp_file}"
+        )
+
+    if top_snp_file.stat().st_size == 0:
+        raise RuntimeError(
+            f"PheWAS cannot run because pairwise COLOC output is empty: {top_snp_file}"
+        )
+
     phewas_out.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = f"""
@@ -584,11 +475,10 @@ set -euo pipefail
 cd "{project_root}"
 python bin/phewas_cis_pqtls.py \\
   --pheno_id {pheno_id} \\
-  --pqtl_dataset {pqtl_dataset} \\
-  --eqtl_dataset {eqtl_dataset}
+  --pqtl_dataset {pqtl_dataset}
 """
 
-    print(f"[TRACKING] PheWAS SNP evidence input found: {top_snp_file}")
+    print(f"[TRACKING] PheWAS pairwise COLOC input found: {top_snp_file}")
     print("[TRACKING] Running PheWAS safety analysis locally...")
     subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
     print(f"[TRACKING] PheWAS safety results found: {phewas_out}")
@@ -645,35 +535,27 @@ def pull_results_local(
     falcon_user: str,
     pqtl_dataset: str,
     pheno_id: str,
-    eqtl_dataset: str,
     local_results_dir: str = "results",
     overwrite: bool = True
 ):
     remote, _ = get_remote_paths(falcon_user)
     remote_mr = f"{remote}/results/cis-MR/{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     remote_coloc = f"{remote}/results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
-    remote_smr = f"{remote}/results/SMR/{eqtl_dataset}/{pheno_id}"
-    remote_eqtl_coloc = f"{remote}/results/eQTL_coloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}"
-    remote_moloc = f"{remote}/results/QTL_moloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}"
-    remote_cojo = f"{remote}/results/COJO/{pqtl_dataset}/{pheno_id}"
+    remote_target_stats = f"{remote}/results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
     local_results_dir = Path(local_results_dir)
     local_mr_dir = local_results_dir / "cis-MR"
     local_coloc_dir = local_results_dir / "coloc" / pqtl_dataset
-    local_smr_dir = local_results_dir / "SMR" / eqtl_dataset / pheno_id
-    local_eqtl_coloc_dir = local_results_dir / "eQTL_coloc" / pqtl_dataset / eqtl_dataset / pheno_id
-    local_moloc_dir = local_results_dir / "QTL_moloc" / pqtl_dataset / eqtl_dataset / pheno_id
-    local_cojo_dir = local_results_dir / "COJO" / pqtl_dataset / pheno_id
+    local_target_stats_dir = local_results_dir / "target_stats" / pqtl_dataset / pheno_id
     local_mr_dir.mkdir(parents=True, exist_ok=True)
     local_coloc_dir.mkdir(parents=True, exist_ok=True)
-    local_smr_dir.mkdir(parents=True, exist_ok=True)
-    local_eqtl_coloc_dir.mkdir(parents=True, exist_ok=True)
-    local_moloc_dir.mkdir(parents=True, exist_ok=True)
-    local_cojo_dir.mkdir(parents=True, exist_ok=True)
+    local_target_stats_dir.mkdir(parents=True, exist_ok=True)
     local_mr = local_mr_dir / f"{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     local_coloc = local_coloc_dir / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
+    local_target_stats = local_target_stats_dir / f"{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
     for remote_file, local_file in [
         (remote_mr, local_mr),
         (remote_coloc, local_coloc),
+        (remote_target_stats, local_target_stats),
     ]:
         if local_file.exists() and not overwrite:
             print(f"[TRACKING] {local_file} already exists locally. Skipping pull.")
@@ -686,46 +568,6 @@ def pull_results_local(
         print(cmd)
         subprocess.run(cmd, shell=True, check=True)
         print(f"[DONE] Pulled results into {local_file}")
-
-    # pull all compiled SMR results
-    if any(local_smr_dir.iterdir()) and not overwrite:
-        print(f"[TRACKING] {local_smr_dir} already contains SMR results. Skipping pull.")
-    else:
-        cmd = (
-            f"scp -r "
-            f"{falcon_user}@falconlogin.cf.ac.uk:{remote_smr}/. "
-            f"{local_smr_dir}/"
-        )
-        print(cmd)
-        subprocess.run(cmd, shell=True, check=True)
-        print(f"[DONE] Pulled SMR results into {local_smr_dir}")
-
-    # pull all GWAS - sc-eQTL COLOC results
-    if any(local_eqtl_coloc_dir.iterdir()) and not overwrite:
-        print(f"[TRACKING] {local_eqtl_coloc_dir} already contains eQTL COLOC results. Skipping pull.")
-    else:
-        cmd = f"scp -r {falcon_user}@falconlogin.cf.ac.uk:{remote_eqtl_coloc}/. {local_eqtl_coloc_dir}/"
-        print(cmd)
-        subprocess.run(cmd, shell=True, check=True)
-        print(f"[DONE] Pulled eQTL COLOC results into {local_eqtl_coloc_dir}")
-
-    # pull all GWAS - pQTL - sc-eQTL MOLOC results
-    if any(local_moloc_dir.iterdir()) and not overwrite:
-        print(f"[TRACKING] {local_moloc_dir} already contains MOLOC results. Skipping pull.")
-    else:
-        cmd = f"scp -r {falcon_user}@falconlogin.cf.ac.uk:{remote_moloc}/. {local_moloc_dir}/"
-        print(cmd)
-        subprocess.run(cmd, shell=True, check=True)
-        print(f"[DONE] Pulled MOLOC results into {local_moloc_dir}")
-
-    # pull all GCTA-COJO results
-    if any(local_cojo_dir.iterdir()) and not overwrite:
-        print(f"[TRACKING] {local_cojo_dir} already contains COJO results. Skipping pull.")
-    else:
-        cmd = f"scp -r {falcon_user}@falconlogin.cf.ac.uk:{remote_cojo}/. {local_cojo_dir}/"
-        print(cmd)
-        subprocess.run(cmd, shell=True, check=True)
-        print(f"[DONE] Pulled COJO results into {local_cojo_dir}")
 
 
 # STREAMLIT DASHBOARD
@@ -750,18 +592,12 @@ python -m streamlit run dashboard/mr_app.py -- \\
 def check_outputs(
     falcon_user: str,
     pqtl_dataset: str,
-    pheno_id: str,
-    eqtl_dataset: str
+    pheno_id: str
 ):
     remote, _ = get_remote_paths(falcon_user)
     mr_res = f"results/cis-MR/{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     coloc_res = f"results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
-    smr_res = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
-    final_targets = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
-    prepared_multi_omics = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_prepared_multi_omics_targets.tsv"
-    eqtl_coloc = f"results/eQTL_coloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_all_eqtl_coloc.tsv"
-    moloc = f"results/QTL_moloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_moloc_summary.tsv"
-    cojo_dir = f"results/COJO/{pqtl_dataset}/{pheno_id}"
+    target_stats_res = f"results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
 
     ssh(f"""
 set -euo pipefail
@@ -783,54 +619,12 @@ else
     echo "[CONCERN] COLOC output not found or empty"
 fi
 
-echo "[TRACKING] Checking SMR output..."
-if [ -d "results/SMR/{eqtl_dataset}/{pheno_id}" ]; then
-    ls -lh "results/SMR/{eqtl_dataset}/{pheno_id}/"
+echo "[TRACKING] Checking top cis-hit compilation output..."
+if [ -s "{target_stats_res}" ]; then
+    ls -lh "{target_stats_res}"
+    head -5 "{target_stats_res}"
 else
-    echo "[CONCERN] SMR output directory not found"
-fi
-
-if [ -s "{smr_res}" ]; then
-    head -5 "{smr_res}"
-else
-    echo "[CONCERN] Promising target SMR file not found or empty"
-fi
-
-if [ -s "{final_targets}" ]; then
-    echo "[TRACKING] Final multi-omics targets found!"
-    head -5 "{final_targets}"
-else
-    echo "[CONCERN] No final multi-omics target TSV found or file is empty"
-fi
-
-echo "[TRACKING] Checking prepared multi-omics targets..."
-if [ -s "{prepared_multi_omics}" ]; then
-    head -5 "{prepared_multi_omics}"
-else
-    echo "[CONCERN] Prepared multi-omics target manifest not found or empty"
-fi
-
-echo "[TRACKING] Checking GWAS - sc-eQTL COLOC output..."
-if [ -s "{eqtl_coloc}" ]; then
-    head -5 "{eqtl_coloc}"
-else
-    echo "[CONCERN] GWAS - sc-eQTL COLOC output not found or empty"
-fi
-
-echo "[TRACKING] Checking GWAS - pQTL - sc-eQTL MOLOC output..."
-if [ -s "{moloc}" ]; then
-    head -5 "{moloc}"
-else
-    echo "[CONCERN] GWAS - pQTL - sc-eQTL MOLOC output not found or empty"
-fi
-
-echo "[TRACKING] Checking GCTA-COJO output..."
-n_cojo=$(find "{cojo_dir}" -mindepth 2 -maxdepth 2 -name "*.jma.cojo" -size +0c 2>/dev/null | wc -l)
-if [ "$n_cojo" -gt 0 ]; then
-    echo "[TRACKING] GCTA-COJO outputs found for $n_cojo loci"
-    find "{cojo_dir}" -mindepth 2 -maxdepth 2 -name "*.jma.cojo" -size +0c -print
-else
-    echo "[CONCERN] No GCTA-COJO .jma.cojo outputs found"
+    echo "[CONCERN] Top cis-hit compilation output not found or empty"
 fi
 """, falcon_user)
 
@@ -847,7 +641,6 @@ def hpc(config: str = "assets/config.yaml"):
     pqtl_dir = cfg.pqtl_dir
     ref_bfile = cfg.ref_bfile
     snp_col = cfg.snp_col
-    eqtl_dataset = cfg.eqtl_dataset
     a1_col = cfg.a1_col
     a2_col = cfg.a2_col
     beta_col = cfg.beta_col
@@ -873,17 +666,10 @@ def hpc(config: str = "assets/config.yaml"):
     qc_out = f"{out_dir}/QC/{pheno_id}/{pheno_id}.tsv"
     mr_out = f"results/cis-MR/{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     coloc_out = f"results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
-    promising_smr_out = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
-    final_smr_out = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
-    prepared_multi_omics_out = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_prepared_multi_omics_targets.tsv"
-    eqtl_coloc_out = f"results/eQTL_coloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_all_eqtl_coloc.tsv"
-    moloc_out = f"results/QTL_moloc/{pqtl_dataset}/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_{eqtl_dataset}_moloc_summary.tsv"
-    summary_out = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_multi_omics_overview.tsv"
-    snp_evidence_out = f"results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_multi_omics_snp_evidence.tsv"
-    cojo_dir = f"results/COJO/{pqtl_dataset}/{pheno_id}"
 
     # change this where NetworkMR saves its final compiled output
     network_mr_out = f"results/network-MR/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_network_MR.tsv"
+    target_stats_out = (f"results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv")
 
     print("[TRACKING] Preparing Falcon repo...")
     clone_repo(falcon_user)
@@ -1034,153 +820,37 @@ def hpc(config: str = "assets/config.yaml"):
 
     require_remote_output(
         falcon_user=falcon_user,
-        path=mr_out,
-        step="cis-MR",
-        required_for="single-cell SMR"
-    )
-
-    require_remote_output(
-        falcon_user=falcon_user,
         path=coloc_out,
         step="COLOC",
-        required_for="single-cell SMR"
+        required_for="Top cis-hit compilation"
     )
 
-    # SMR
+    # compile final hits 
     if not check_remote_output(
         falcon_user=falcon_user,
-        path=final_smr_out,
-        step="single-cell SMR",
+        path=target_stats_out,
+        step="Top cis-hit compilation",
         overwrite=overwrite
     ):
-        print(f"[TRACKING] Running single-cell SMR for {eqtl_dataset}...")
-        run_smr(
-            falcon_user=falcon_user,
-            pqtl_dataset=pqtl_dataset,
-            eqtl_dataset=eqtl_dataset,
-            maf=maf,
-            ref_bfile=ref_bfile,
-            sumstats=qc_out,
-            pheno_id=pheno_id
-        )
-
-    require_remote_output(
-        falcon_user=falcon_user,
-        path=final_smr_out,
-        step="single-cell SMR",
-        required_for="multi-omics QTL colocalisation"
-    )
-
-    # multi-omics QTL colocalisation
-    # GWAS - sc-eQTL pairwise coloc
-    # GWAS - pQTL - sc-eQTL MOLOC
-    if not check_remote_output(
-        falcon_user=falcon_user,
-        path=moloc_out,
-        step="multi-omics QTL colocalisation",
-        overwrite=overwrite
-    ):
-        print("[TRACKING] Running multi-omics QTL colocalisation...")
-        run_multi_omics_coloc(
+        print("[TRACKING] Compiling harmonised top cis-hit table...")
+        compile_top_hits(
             falcon_user=falcon_user,
             pheno_id=pheno_id,
             pqtl_dataset=pqtl_dataset,
-            eqtl_dataset=eqtl_dataset,
-            n_cases=n_cases,
-            n_controls=n_controls
         )
 
     require_remote_output(
         falcon_user=falcon_user,
-        path=prepared_multi_omics_out,
-        step="multi-omics target preparation",
-        required_for="pipeline completion"
+        path=target_stats_out,
+        step="Top cis-hit compilation",
+        required_for="Dashboard target information"
     )
-
-    require_remote_output(
-        falcon_user=falcon_user,
-        path=eqtl_coloc_out,
-        step="GWAS - sc-eQTL COLOC",
-        required_for="pipeline completion"
-    )
-
-    require_remote_output(
-        falcon_user=falcon_user,
-        path=moloc_out,
-        step="GWAS - pQTL - sc-eQTL MOLOC",
-        required_for="pipeline completion"
-    )
-
-    # grab onto master df for 2 key SNPs
-    overview_done = check_remote_output(
-        falcon_user=falcon_user,
-        path=summary_out,
-        step="multi-omics overview",
-        overwrite=overwrite
-    )
-
-    snp_done = check_remote_output(
-        falcon_user=falcon_user,
-        path=snp_evidence_out,
-        step="multi-omics SNP evidence",
-        overwrite=overwrite
-    )
-
-    if not (overview_done and snp_done):
-        print("[TRACKING] Building dashboard-ready multi-omics tables...")
-        run_multi_omics_summary(
-            falcon_user=falcon_user,
-            pheno_id=pheno_id,
-            pqtl_dataset=pqtl_dataset,
-            eqtl_dataset=eqtl_dataset,
-        )
-
-    require_remote_output(
-        falcon_user=falcon_user,
-        path=summary_out,
-        step="multi-omics overview",
-        required_for="pipeline completion"
-    )
-
-    require_remote_output(
-        falcon_user=falcon_user,
-        path=snp_evidence_out,
-        step="multi-omics SNP evidence",
-        required_for="pipeline completion"
-    )
-
-    # GCTA-COJO
-    if not check_remote_cojo(
-        falcon_user=falcon_user,
-        pqtl_dataset=pqtl_dataset,
-        pheno_id=pheno_id,
-        overwrite=overwrite
-    ):
-        print("[TRACKING] Running GCTA-COJO...")
-        run_cojo(
-            falcon_user=falcon_user,
-            pheno_id=pheno_id,
-            pqtl_dataset=pqtl_dataset,
-            eqtl_dataset=eqtl_dataset,
-            ref_bfile=ref_bfile,
-        )
-
-    if not check_remote_cojo(
-        falcon_user=falcon_user,
-        pqtl_dataset=pqtl_dataset,
-        pheno_id=pheno_id,
-        overwrite=False
-    ):
-        raise RuntimeError(
-            f"No GCTA-COJO outputs were produced in {cojo_dir}"
-        )
 
     print("[TRACKING] Checking outputs...")
     check_outputs(
         falcon_user=falcon_user,
         pqtl_dataset=pqtl_dataset,
         pheno_id=pheno_id,
-        eqtl_dataset=eqtl_dataset,
     )
 
     print("[TRACKING] Pulling results locally...")
@@ -1188,7 +858,6 @@ def hpc(config: str = "assets/config.yaml"):
         falcon_user=falcon_user,
         pqtl_dataset=pqtl_dataset,
         pheno_id=pheno_id,
-        eqtl_dataset=eqtl_dataset,
         local_results_dir=local_results_dir,
         overwrite=overwrite,
     )
@@ -1197,15 +866,11 @@ def hpc(config: str = "assets/config.yaml"):
     phewas_safety(
         pheno_id=pheno_id,
         pqtl_dataset=pqtl_dataset,
-        eqtl_dataset=eqtl_dataset,
         local_results_dir=local_results_dir,
         overwrite=overwrite,
     )
 
-    print(f"[TRACKING] Expected promising target SMR output: {promising_smr_out}")
-    print(f"[TRACKING] Expected final multi-omics target output: {final_smr_out}")
-    print(f"[TRACKING] Expected prepared multi-omics target output: {prepared_multi_omics_out}")
-    print(f"[TRACKING] Expected GWAS - sc-eQTL COLOC output: {eqtl_coloc_out}")
-    print(f"[TRACKING] Expected GWAS - pQTL - sc-eQTL MOLOC output: {moloc_out}")
-    print(f"[TRACKING] Expected GCTA-COJO output directory: {cojo_dir}")
+    print(f"[TRACKING] Expected cis-MR output: {mr_out}")
+    print(f"[TRACKING] Expected pairwise COLOC output: {coloc_out}")
+    print(f"[TRACKING] Expected top cis-hit output: {target_stats_out}")
     print("[DONE] drugMR pipeline completed successfully.")

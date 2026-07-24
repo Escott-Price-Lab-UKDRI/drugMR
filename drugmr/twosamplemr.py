@@ -7,13 +7,11 @@ class PyTwoSampleMR:
 
     """
     Assortment of Mendelian Randomisation functions for generalised usability in drugMR pipeline
-    # 1. IVW
-    # 2. Cochran Q 
+    # 1. IVW + DELTA METHOD 
     """
 
     def __init__(self):
         pass
-
 
     # standard IVW 
     def IVW(
@@ -119,8 +117,6 @@ class PyTwoSampleMR:
             "CI_LOW": [CI_LOW_IVW],
             "CI_HIGH": [CI_HIGH_IVW]
         })
-
         return ivw_result, snp_results
     
-    # cochran q only for IVW
-    # def Cochran_Q():
+    # def WME -> At least 50% of instruments have valid IVWs
