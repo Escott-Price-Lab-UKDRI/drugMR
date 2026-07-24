@@ -24,7 +24,7 @@ n_cases      <- as.numeric(args[6])
 n_controls   <- as.numeric(args[7])
 
 exposure_def <- "quant"
-pp4_thresh   <- 0.75
+pp4_thresh   <- 0.70
 outcome_def  <- "cc"   # might have to change this at some other stage
 out_dir <- file.path("./results/coloc", pqtl_dataset)
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)

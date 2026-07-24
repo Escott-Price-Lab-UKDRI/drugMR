@@ -93,13 +93,25 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
   
   # compile all res
   all_results <- list()
+  all_instruments <- list()
+
   
   # this is just so if one protein crashes later, we dont lose all the ones that worked
   out_file_running <- file.path(out_dir, paste0(pqtl_dataset, "_", pheno_id, "_all_MR.running.tsv"))
   out_file_final <- file.path(out_dir, paste0(pqtl_dataset, "_", pheno_id, "_all_MR.tsv"))
-  
+
+  # for saving instruments
+  instruments_dir <- file.path(out_dir, "instruments")
+  dir.create(instruments_dir, recursive = TRUE, showWarnings = FALSE)
+  out_instruments_running <- file.path(instruments_dir, paste0(pqtl_dataset, "_", pheno_id, "_all_MR_instruments.running.tsv"))
+  out_instruments_final <- file.path(instruments_dir, paste0(pqtl_dataset, "_", pheno_id, "_all_MR_instruments.tsv"))
+ 
   if (file.exists(out_file_running)) {
     file.remove(out_file_running)
+  }
+
+  if (file.exists(out_instruments_running)) {
+    file.remove(out_instruments_running)
   }
   
   for (i in protein_dirs) {
@@ -290,6 +302,62 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       }
       
       dat.clump <- data.table::as.data.table(dat.clump)
+
+      # saving instruments
+      instruments.temp <- data.table::copy(dat.clump)
+      setorder(instruments.temp, pval.exposure)
+      instruments.temp[, instrument_rank := seq_len(.N)]
+      instruments.temp[, protein := protein]
+      instruments.temp[, pqtl_dataset := pqtl_dataset]
+      instruments.temp[, outcome_trait := pheno_id]
+      instruments.temp[, selection_method := "LD_CLUMP"]
+      instruments.temp[, clump_kb := 10000]
+      instruments.temp[, clump_r2 := 0.001]
+      instruments.temp[, used_in_mr := TRUE]
+      instrument_cols <- c(
+        "protein",
+        "pqtl_dataset",
+        "outcome_trait",
+        "instrument_rank",
+        "SNP",
+        "effect_allele.exposure",
+        "other_allele.exposure",
+        "eaf.exposure",
+        "beta.exposure",
+        "se.exposure",
+        "pval.exposure",
+        "samplesize.exposure",
+        "F",
+        "effect_allele.outcome",
+        "other_allele.outcome",
+        "eaf.outcome",
+        "beta.outcome",
+        "se.outcome",
+        "pval.outcome",
+        "samplesize.outcome",
+        "rsq.exposure",
+        "rsq.outcome",
+        "steiger_dir",
+        "steiger_pval",
+        "mr_keep",
+        "palindromic",
+        "ambiguous",
+        "selection_method",
+        "clump_kb",
+        "clump_r2",
+        "used_in_mr"
+      )
+      
+      instrument_cols <- instrument_cols[instrument_cols %in% names(instruments.temp)]
+      instruments.temp <- instruments.temp[,
+        ..instrument_cols
+      ]
+      
+      all_instruments[[protein]] <- instruments.temp
+      # save as it goes, because otherwise if one protein explodes
+      # all previously selected instrument sets would be lost
+      fwrite(instruments.temp, out_instruments_running, sep = "\t", append = file.exists(out_instruments_running), col.names = !file.exists(out_instruments_running))
+      print(paste0("[TRACKING] Saved ", nrow(instruments.temp), " final cis-MR instruments for ", protein))
       
       # ~~~~~~~~~~
       # run MR
@@ -469,6 +537,69 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
   out_file <- file.path(out_dir, paste0(pqtl_dataset, "_", pheno_id, "_all_MR.tsv"))
   fwrite(all_results, out_file, sep = "\t")
   print(paste0("Saved all MR results: ", out_file))
+
+  # save the final combined instrument set across all proteins
+  all_instruments <- rbindlist(all_instruments, fill = TRUE, use.names = TRUE)
+  if (nrow(all_instruments) > 0) {
+    
+    setorder(
+      all_instruments,
+      protein,
+      instrument_rank
+    )
+    
+    fwrite(
+      all_instruments,
+      out_instruments_final,
+      sep = "\t"
+    )
+    
+    print(
+      paste0(
+        "Saved all cis-MR instruments: ",
+        out_instruments_final
+      )
+    )
+    
+    print(
+      paste0(
+        "Total instruments saved: ",
+        nrow(all_instruments)
+      )
+    )
+    
+    print(
+      paste0(
+        "Proteins with instruments: ",
+        uniqueN(all_instruments$protein)
+      )
+    )
+    
+  } else {
+    
+    print(
+      "[CONCERN] No cis-MR instruments were generated."
+    )
+    
+  }
+  
+  if (file.exists(out_file_running)) {
+    print(
+      paste0(
+        "Saved running MR results too: ",
+        out_file_running
+      )
+    )
+  }
+  
+  if (file.exists(out_instruments_running)) {
+    print(
+      paste0(
+        "Saved running instrument results too: ",
+        out_instruments_running
+      )
+    )
+  }
   
   if (file.exists(out_file_running)) {
     print(paste0("Saved running MR results too: ", out_file_running))

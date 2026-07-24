@@ -44,14 +44,14 @@ def pairwise_coloc(pqtl_dataset: str, local_results_dir: str, pqtl_dir: str, phe
         .filter(
             (
                 (pl.col("n_instruments") >= 3) & ###### CHANGE - MAYBE DURING CI/CD  
-                (pl.col("IVW_FDR_q") < 1) & ###### CHANGE - MAYBE DURING CI/CD  
+                (pl.col("IVW_FDR_q") < 0.05) & ###### CHANGE - MAYBE DURING CI/CD  
                 (pl.col("egger_intercept_pval") > 0) & ###### CHANGE - MAYBE DURING CI/CD  
-                (pl.col("Q_pval") > 0) ###### CHANGE - MAYBE DURING CI/CD  
+                (pl.col("Q_pval") > 0.05) ###### CHANGE - MAYBE DURING CI/CD  
             )
             |
             (
                 (pl.col("n_instruments") == 1) & ###### CHANGE - MAYBE DURING CI/CD  
-                (pl.col("Wald_FDR_q") < 1) ###### CHANGE - MAYBE DURING CI/CD  
+                (pl.col("Wald_FDR_q") < 0.05) ###### CHANGE - MAYBE DURING CI/CD  
             )
         )
         .select("protein")

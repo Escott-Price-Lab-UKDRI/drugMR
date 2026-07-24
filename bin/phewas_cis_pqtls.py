@@ -7,29 +7,30 @@ import polars as pl
 import pandas as pd 
 from drugmr import PheWAS
 # from statsmodels.stats.multitest import fdrcorrection
-from drugmr import PyTwoSampleMR
+from drugmr.twosamplemr import PyTwoSampleMR
 
 # -----------------------------------
 # THIS SCRIPT SHALL NOT BE RAN IN HPC
 # -----------------------------------
-# 2,511 ICD coded endppoints vs total 2,755 
+# 2,511 ICD coded endpoints vs total 2,755 
 finngen_icd_endpoints = 2511
-# For any targets on teh final file - focus strictly on cis-pQTL -> store that as a string within variable X
-# Query phewas for FinnGen r13 using the lead cis-pQTL SNP
+# The COLOC output is used strictly to define which protein targets go into PheWAS
+# For every selected target - grab the exact SNPs which were used in cis-MR
+# Make A1 the AD risk allele for every cis-MR instrument
+# Align pQTL beta + FinnGen beta to the AD risk allele before Wald ratio / IVW
 # FinnGen BETA == effect of ALT allele
-# Make sure pQTL beta + FinnGen beta == aligned to the original outcome GWAS A1 before running Wald ratio / IVW
 # For each pheno -> ensure ICD-10 coded
-# For each pheno (from p_nominal and beta) -> compute SE
 # TO DO'S
 # ONLY KEEP THE ONES WHICH FOLLOW ICD-10 CODING
 # ICD-10 disease endpoints
 # ONLY KEEP ICD-10 disease endpoint pertaining to the defined 2019 chapters (see Supplementary)
 # clean pheWAS file to only include the phenos which == present in FinnGen
 
-# ------ ADD COJO STUFF
-# ------ IF SIGNAL == 1 SNP THEN WALD AND CARRY ON - 
-# ------ ELSE - RUN IVW 
-# ------ THEN FDR CORRECT ACROSS ALL ESTIMATES REGARDLESS OF METHOD
+# ------ NO COJO HERE
+# ------ IF 1 cis-MR INSTRUMENT IS AVAILABLE IN FINNGEN THEN WALD AND CARRY ON - 
+# ------ IF >1 cis-MR INSTRUMENT IS AVAILABLE IN FINNGEN THEN RUN IVW
+# ------ THEN BONFERRONI CORRECT ACROSS ALL ESTIMATES REGARDLESS OF METHOD
+
 
 def clean_phewas_hit(snp: str, rsid: str):
     # snp = "10-96304051-A-G" # chromosome-position-reference-alternative format
@@ -60,191 +61,227 @@ def clean_phewas_hit(snp: str, rsid: str):
     return df
 
 
-# this script runs AFTER THE final TARGET file 
-def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset: str):
-    # ukb_ppp_AD_multi_omics_snp_evidence.tsv
-    # for any target.unique()
-    # Lead pQTL SNP
-    top_snp_file = f"./results/SMR/{eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_multi_omics_snp_evidence.tsv"
-    df = pl.read_csv(top_snp_file, separator="\t")
+# this script runs AFTER cis-MR + pairwise pQTL-GWAS COLOC
+def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str):
+    # COLOC defines the targets only
+    # each protein_id == its own protein assay / aptamer
+    coloc_file = f"./results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
+    df_coloc = pl.read_csv(coloc_file, separator="\t")
+
+    if "protein_id" in df_coloc.columns:
+        df_coloc = df_coloc.rename({"protein_id": "protein"})
+
+    if "protein" not in df_coloc.columns:
+        raise ValueError(
+            f"Could not find protein_id or protein in COLOC file: {coloc_file}"
+        )
+    compelling_targets = (df_coloc.select(pl.col("protein").cast(pl.Utf8)).drop_nulls().unique(maintain_order=True))
+    # exact harmonised instruments which were used in the original cis-MR
+    instruments_file = (f"./results/cis-MR/instruments/{pqtl_dataset}_{pheno_id}_all_MR_instruments.tsv")
+    df_instruments = pl.read_csv(instruments_file, separator="\t")
+    required_instrument_cols = [
+        "protein",
+        "pqtl_dataset",
+        "outcome_trait",
+        "SNP",
+        "effect_allele.exposure",
+        "other_allele.exposure",
+        "beta.exposure",
+        "se.exposure",
+        "pval.exposure",
+        "effect_allele.outcome",
+        "other_allele.outcome",
+        "beta.outcome",
+        "used_in_mr",
+    ]
+
+    df_instruments = (
+        df_instruments
+        .with_columns(
+            pl.col("protein").cast(pl.Utf8),
+            pl.col("pqtl_dataset").cast(pl.Utf8),
+            pl.col("outcome_trait").cast(pl.Utf8),
+            pl.col("SNP").cast(pl.Utf8),
+            pl.col("effect_allele.exposure").cast(pl.Utf8).str.to_uppercase(),
+            pl.col("other_allele.exposure").cast(pl.Utf8).str.to_uppercase(),
+            pl.col("beta.exposure").cast(pl.Float64),
+            pl.col("se.exposure").cast(pl.Float64),
+            pl.col("pval.exposure").cast(pl.Float64),
+            pl.col("effect_allele.outcome").cast(pl.Utf8).str.to_uppercase(),
+            pl.col("other_allele.outcome").cast(pl.Utf8).str.to_uppercase(),
+            pl.col("beta.outcome").cast(pl.Float64),
+            (
+                pl.col("used_in_mr")
+                .cast(pl.Utf8)
+                .str.to_uppercase()
+                .eq("TRUE")
+            ).alias("used_in_mr"),
+        )
+        .filter(
+            (pl.col("pqtl_dataset") == pqtl_dataset) &
+            (pl.col("outcome_trait") == pheno_id) &
+            (pl.col("used_in_mr") == True)
+        )
+        .join(compelling_targets, on="protein", how="inner")
+        .unique(subset=["protein", "SNP"], keep="first")
+    )
+
     # temp_dir
     temp_dir = f"./work/PheWAS/{pqtl_dataset}_{pheno_id}"
     os.makedirs(temp_dir, exist_ok=True)
     out_dir = f"./results/PheWAS/{pqtl_dataset}/{pheno_id}"
     os.makedirs(out_dir, exist_ok=True)
-    # only retain the Lead pQTL SNP for each protein
-    df = (df.filter(pl.col("snp_type") == "Lead pQTL SNP").unique(subset=["protein", "SNP"], keep="first"))
-    print(f"[TRACKING] Number of compelling targets for PheWAS: {df['protein'].n_unique()}...")
+    print(f"[TRACKING] Number of compelling COLOC targets for PheWAS: {compelling_targets.height}...")
+    print(f"[TRACKING] Number of retained cis-MR instrument rows: {df_instruments.height}...")
     results = []
-    for row in df.iter_rows(named=True):
-        protein = row["protein"]
-        rsid = row["SNP"]
-        # A1/A2 from the multi-omics SNP evidence file
-        # this is the canonical allele orientation used across all downstream analyses
-        canonical_A1 = str(row["A1"]).upper()
-        canonical_A2 = str(row["A2"]).upper()
-        # cojo results for any given target 
-        mr = PyTwoSampleMR()
-        cojo_file = Path(f"./results/COJO/{pqtl_dataset}/{pheno_id}/{protein}/{protein}.jma.cojo")
-
-        if not cojo_file.exists():
-            print(f"[TRACKING] No COJO results found for {protein}: {cojo_file}...")
-            continue
-
-        df_cojo = pl.read_csv(cojo_file, separator="\t")
-        cojo_snps = df_cojo["SNP"].cast(pl.Utf8).to_list()
-        n_cojo_snps = len(cojo_snps)
-
-        print(
-            f"[TRACKING] Number of independent COJO signals for "
-            f"{protein}: {n_cojo_snps}..."
-        )
-        print(f"[TRACKING] COJO SNPs for {protein}: {cojo_snps}...")
-
-
-        # read the original pQTL cis-region
-        # COJO is used to identify which signals are independent
-        # but for MR use the original marginal pQTL beta + SE
-        pqtl_file = Path(f"./dat/cis_regions/{pqtl_dataset}/{protein}/pqtl.parquet")
-        df_pqtl = pl.read_parquet(pqtl_file)
-        df_pqtl = (
-            df_pqtl
-            .with_columns(
-                pl.col("SNP").cast(pl.Utf8),
-                pl.col("A1").cast(pl.Utf8).str.to_uppercase(),
-                pl.col("A2").cast(pl.Utf8).str.to_uppercase(),
-            )
-            .filter(pl.col("SNP").is_in(cojo_snps))
-            .unique(subset=["SNP"], keep="first")
+    mr = PyTwoSampleMR()
+    # run every protein assay / aptamer within the COLOC file
+    for target_row in compelling_targets.iter_rows(named=True):
+        protein = target_row["protein"]
+        df_target_instruments = (
+            df_instruments
+            .filter(pl.col("protein") == protein)
+            .sort("instrument_rank")
+            if "instrument_rank" in df_instruments.columns
+            else df_instruments.filter(pl.col("protein") == protein)
         )
 
-        if df_pqtl.height != n_cojo_snps:
-            missing_snps = list(set(cojo_snps) - set(df_pqtl["SNP"].to_list()))
+        if df_target_instruments.height == 0:
             print(
-                f"[TRACKING] Could not recover all COJO SNPs from the "
-                f"original pQTL file for {protein}: {missing_snps}..."
+                f"[TRACKING] No used_in_mr cis-MR instruments found for "
+                f"{protein} in {instruments_file}..."
             )
             continue
 
+        instrument_snps = df_target_instruments["SNP"].to_list()
+        n_cis_mr_instruments = len(instrument_snps)
+        print(
+            f"[TRACKING] Number of cis-MR instruments for "
+            f"{protein}: {n_cis_mr_instruments}..."
+        )
+        print(f"[TRACKING] cis-MR SNPs for {protein}: {instrument_snps}...")
 
-        # read the original outcome GWAS cis-region
-        # A1 == outcome GWAS effect allele used across all downstream analyses
-        gwas_file = Path(f"./dat/cis_regions/{pqtl_dataset}/{protein}/gwas.parquet")
-
-        if not gwas_file.exists():
-            print(f"[TRACKING] No outcome GWAS cis-region found for {protein}: {gwas_file}...")
+        # CHR + BP are only recovered here to construct the FinnGen API variant
+        # exposure beta + SE + alleles remain strictly from the cis-MR instruments file
+        pqtl_file = Path(f"./dat/cis_regions/{pqtl_dataset}/{protein}/pqtl.parquet")
+        if not pqtl_file.exists():
+            print(f"[TRACKING] Original pQTL cis-region not found for {protein}: {pqtl_file}...")
             continue
 
-        df_gwas = pl.read_parquet(gwas_file)
-        df_gwas = (
-            df_gwas
+        df_pqtl_positions = (
+            pl.read_parquet(pqtl_file)
             .select(
                 pl.col("SNP").cast(pl.Utf8),
-                pl.col("A1").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A1"),
-                pl.col("A2").cast(pl.Utf8).str.to_uppercase().alias("GWAS_A2"),
-                pl.col("BETA").alias("GWAS_BETA"),
+                pl.col("CHR").cast(pl.Utf8),
+                pl.col("BP").cast(pl.Int64),
             )
-            .filter(pl.col("SNP").is_in(cojo_snps))
+            .filter(pl.col("SNP").is_in(instrument_snps))
             .unique(subset=["SNP"], keep="first")
         )
 
-        if df_gwas.height != n_cojo_snps:
-            missing_snps = list(set(cojo_snps) - set(df_gwas["SNP"].to_list()))
-            print(
-                f"[TRACKING] Could not recover all COJO SNPs from the "
-                f"original outcome GWAS file for {protein}: {missing_snps}..."
-            )
-            continue
-
-
-        # match original pQTL effects against outcome GWAS A1/A2
-        df_pqtl = df_pqtl.join(
-            df_gwas,
+        df_target_instruments = df_target_instruments.join(
+            df_pqtl_positions,
             on="SNP",
             how="inner"
         )
 
-        if df_pqtl.height != n_cojo_snps:
-            missing_snps = list(set(cojo_snps) - set(df_pqtl["SNP"].to_list()))
+        if df_target_instruments.height != len(instrument_snps):
+            recovered_snps = set(df_target_instruments["SNP"].to_list())
+            missing_snps = sorted(set(instrument_snps) - recovered_snps)
             print(
-                f"[TRACKING] Could not match all COJO SNPs between the "
-                f"pQTL and outcome GWAS files for {protein}: {missing_snps}..."
+                f"[TRACKING] Could not recover CHR/BP for all cis-MR "
+                f"instruments for {protein}: {missing_snps}..."
             )
             continue
 
-
-        # make sure cis-pQTL SNP in protein == Lead pQTL SNP == the same one as the COJO one
-        if n_cojo_snps == 1 and cojo_snps[0] != rsid:
-            print(
-                f"[TRACKING] Lead pQTL SNP does not match the single "
-                f"COJO signal for {protein}: lead={rsid}, COJO={cojo_snps[0]}..."
-            )
-            continue
-
-        if rsid not in cojo_snps:
-            print(
-                f"[TRACKING] Lead pQTL SNP {rsid} is not present in the "
-                f"COJO-selected signals for {protein}..."
-            )
-
-        protein_results = []
         signal_phewas = {}
-        # query every COJO-selected independent SNP in FinnGen
-        for cojo_row in df_pqtl.iter_rows(named=True):
-            cojo_rsid = str(cojo_row["SNP"])
-
-            # A1/A2 == effect/other allele for the original pQTL beta
-            pqtl_effect_allele = str(cojo_row["A1"]).upper()
-            pqtl_other_allele = str(cojo_row["A2"]).upper()
-
-            # GWAS_A1/GWAS_A2 == original outcome GWAS effect/other allele
-            gwas_effect_allele = str(cojo_row["GWAS_A1"]).upper()
-            gwas_other_allele = str(cojo_row["GWAS_A2"]).upper()
-            gwas_beta_original = float(cojo_row["GWAS_BETA"])
-
-            # for the Lead pQTL SNP, use A1/A2 from the multi-omics SNP evidence file
-            if cojo_rsid == rsid:
-                A1 = canonical_A1
-                A2 = canonical_A2
+        # query every SNP which was actually used in cis-MR
+        for instrument_row in df_target_instruments.iter_rows(named=True):
+            rsid = str(instrument_row["SNP"])
+            exposure_effect_allele = str(instrument_row["effect_allele.exposure"]).upper()
+            exposure_other_allele = str(instrument_row["other_allele.exposure"]).upper()
+            beta_exposure = float(instrument_row["beta.exposure"])
+            se_exposure = float(instrument_row["se.exposure"])
+            p_exposure = float(instrument_row["pval.exposure"])
+            ad_effect_allele = str(instrument_row["effect_allele.outcome"]).upper()
+            ad_other_allele = str(instrument_row["other_allele.outcome"]).upper()
+            beta_ad_original = float(instrument_row["beta.outcome"])
+            chromosome = str(instrument_row["CHR"]).replace("chr", "")
+            position = int(instrument_row["BP"])
+            # make A1 the AD risk-increasing allele
+            # this guarantees beta_ad > 0 relative to A1
+            if beta_ad_original > 0:
+                A1 = ad_effect_allele
+                A2 = ad_other_allele
+                beta_ad = beta_ad_original
+                ad_A1_flipped = False
+            elif beta_ad_original < 0:
+                A1 = ad_other_allele
+                A2 = ad_effect_allele
+                beta_ad = -beta_ad_original
+                ad_A1_flipped = True
             else:
-                # additional COJO signals are not necessarily represented in the
-                # multi-omics SNP evidence file, so retain their outcome GWAS orientation
-                A1 = gwas_effect_allele
-                A2 = gwas_other_allele
+                print(f"[TRACKING] AD beta is zero for {rsid}...")
+                continue
 
-            # align outcome GWAS beta to the canonical A1
-            if gwas_effect_allele == A1 and gwas_other_allele == A2:
-                gwas_beta = gwas_beta_original
-                gwas_A1_flipped = False
+            # pQTL BETA originally corresponds to effect_allele.exposure
+            # align pQTL beta to the AD risk allele A1
+            beta_exposure_original = beta_exposure
+            if (
+                exposure_effect_allele == A1 and
+                exposure_other_allele == A2
+            ):
+                exposure_A1_flipped = False
 
-            elif gwas_effect_allele == A2 and gwas_other_allele == A1:
-                gwas_beta = -gwas_beta_original
-                gwas_A1_flipped = True
+            elif (
+                exposure_effect_allele == A2 and
+                exposure_other_allele == A1
+            ):
+                beta_exposure = -beta_exposure
+                exposure_A1_flipped = True
 
             else:
                 print(
-                    f"[TRACKING] Outcome GWAS alleles "
-                    f"{gwas_effect_allele}/{gwas_other_allele} "
-                    f"do not match canonical A1/A2 {A1}/{A2} "
-                    f"for {cojo_rsid}..."
+                    f"[TRACKING] Exposure alleles "
+                    f"{exposure_effect_allele}/{exposure_other_allele} "
+                    f"do not match AD risk alleles {A1}/{A2} "
+                    f"for {rsid}..."
                 )
                 continue
 
-            chromosome = str(cojo_row["CHR"])
-            position = int(cojo_row["BP"])
+            print(
+                f"[TRACKING] AD risk alignment for {rsid}: "
+                f"A1={A1}, A2={A2}, "
+                f"AD beta={beta_ad}, "
+                f"original pQTL beta={beta_exposure_original}, "
+                f"A1-aligned pQTL beta={beta_exposure}, "
+                f"pQTL flipped={exposure_A1_flipped}..."
+            )
 
             # FinnGen requires chromosome-position-reference-alternative
-            # try both outcome GWAS allele orders and retain whichever FinnGen accepts
-            snp_first_order = f"{chromosome}-{position}-{A1}-{A2}"
-            snp_second_order = f"{chromosome}-{position}-{A2}-{A1}"
-            response = requests.get(f"https://r13.finngen.fi/api/variant/{snp_first_order}", timeout=60)
+            # try both allele orders and retain whichever FinnGen accepts
+            snp_first_order = (
+                f"{chromosome}-{position}-"
+                f"{A1}-{A2}"
+            )
+            snp_second_order = (
+                f"{chromosome}-{position}-"
+                f"{A2}-{A1}"
+            )
+            response = requests.get(
+                f"https://r13.finngen.fi/api/variant/{snp_first_order}",
+                timeout=60
+            )
 
             if response.status_code == 200 and len(response.json().get("results", [])) > 0:
                 snp = snp_first_order
                 finngen_ref = A1
                 finngen_alt = A2
             else:
-                response = requests.get(f"https://r13.finngen.fi/api/variant/{snp_second_order}", timeout=60)
+                response = requests.get(
+                    f"https://r13.finngen.fi/api/variant/{snp_second_order}",
+                    timeout=60
+                )
 
                 if response.status_code == 200 and len(response.json().get("results", [])) > 0:
                     snp = snp_second_order
@@ -252,56 +289,33 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                     finngen_alt = A1
                 else:
                     print(
-                        f"[TRACKING] FinnGen variant could not be resolved for {cojo_rsid}. "
+                        f"[TRACKING] FinnGen variant could not be resolved for {rsid}. "
                         f"Tried {snp_first_order} and {snp_second_order}..."
                     )
                     continue
 
             print(
-                f"[TRACKING] FinnGen REF/ALT resolved for {cojo_rsid}: "
+                f"[TRACKING] FinnGen REF/ALT resolved for {rsid}: "
                 f"REF={finngen_ref}, ALT={finngen_alt}..."
             )
-
-            beta_original = float(cojo_row["BETA"])
-            beta = beta_original
-            se = float(cojo_row["SE"])
-            P = float(cojo_row["P"])
-
-            # pQTL BETA originally corresponds to pQTL A1
-            # align pQTL beta to outcome GWAS A1
-            if pqtl_effect_allele == A1 and pqtl_other_allele == A2:
-                pqtl_A1_flipped = False
-            elif pqtl_effect_allele == A2 and pqtl_other_allele == A1:
-                beta = -beta
-                pqtl_A1_flipped = True
-            else:
-                print(
-                    f"[TRACKING] pQTL alleles {pqtl_effect_allele}/{pqtl_other_allele} "
-                    f"do not match outcome GWAS A1/A2 {A1}/{A2} "
-                    f"for {cojo_rsid}..."
-                )
-                continue
-
-            print(
-                f"[TRACKING] pQTL alignment for {cojo_rsid}: "
-                f"original effect allele={pqtl_effect_allele}, "
-                f"outcome GWAS A1={A1}, "
-                f"original beta={beta_original}, "
-                f"A1-aligned beta={beta}, "
-                f"flipped={pqtl_A1_flipped}..."
-            )
-            print(f"[TRACKING] Running FinnGen PheWAS for {protein}: {cojo_rsid} ({snp})...")
+            print(f"[TRACKING] Running FinnGen PheWAS for {protein}: {rsid} ({snp})...")
 
             # query to phewas db and clean
-            df_phewas = clean_phewas_hit(snp=snp, rsid=cojo_rsid)
-            df_phewas.to_csv(os.path.join(temp_dir, f"{protein}_{cojo_rsid}_raw_hits.csv"), index=False)
+            df_phewas = clean_phewas_hit(snp=snp, rsid=rsid)
+            df_phewas.to_csv(os.path.join(temp_dir, f"{protein}_{rsid}_raw_hits.csv"), index=False)
             df_phewas = pl.from_pandas(df_phewas)
 
             # FinnGen BETA == effect of ALT allele
-            # align every FinnGen phenotype beta to outcome GWAS A1
-            if finngen_alt == A1 and finngen_ref == A2:
+            # align FinnGen beta directly to the AD risk allele A1
+            if (
+                finngen_alt == A1 and
+                finngen_ref == A2
+            ):
                 phewas_A1_flipped = False
-            elif finngen_alt == A2 and finngen_ref == A1:
+            elif (
+                finngen_alt == A2 and
+                finngen_ref == A1
+            ):
                 df_phewas = df_phewas.with_columns(
                     (-pl.col("BETA")).alias("BETA")
                 )
@@ -309,103 +323,118 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
             else:
                 print(
                     f"[TRACKING] FinnGen REF/ALT {finngen_ref}/{finngen_alt} "
-                    f"do not match outcome GWAS A1/A2 {A1}/{A2} "
-                    f"for {cojo_rsid}..."
+                    f"do not match AD risk alleles {A1}/{A2} "
+                    f"for {rsid}..."
                 )
                 continue
 
             print(
-                f"[TRACKING] FinnGen alignment for {cojo_rsid}: "
+                f"[TRACKING] FinnGen alignment for {rsid}: "
                 f"FinnGen ALT={finngen_alt}, "
-                f"outcome GWAS A1={A1}, "
+                f"AD risk A1={A1}, "
                 f"flipped={phewas_A1_flipped}..."
             )
 
-            signal_phewas[cojo_rsid] = {
-                "rsid": cojo_rsid,
+            signal_phewas[rsid] = {
+                "rsid": rsid,
                 "snp": snp,
                 "A1": A1,
                 "A2": A2,
-                "gwas_beta": gwas_beta,
+                "ad_effect_allele_original": ad_effect_allele,
+                "ad_other_allele_original": ad_other_allele,
+                "beta_ad_original": beta_ad_original,
+                "beta_ad": beta_ad,
+                "ad_A1_flipped": ad_A1_flipped,
+                "exposure_effect_allele": exposure_effect_allele,
+                "exposure_other_allele": exposure_other_allele,
                 "finngen_ref": finngen_ref,
                 "finngen_alt": finngen_alt,
-                "pqtl_effect_allele_original": pqtl_effect_allele,
-                "pqtl_other_allele_original": pqtl_other_allele,
-                "beta_pqtl_original": beta_original,
-                "beta_pqtl": beta,
-                "pqtl_A1_flipped": pqtl_A1_flipped,
+                "beta_exposure_original": beta_exposure_original,
+                "beta_exposure": beta_exposure,
+                "exposure_A1_flipped": exposure_A1_flipped,
+                "se_exposure": se_exposure,
+                "p_exposure": p_exposure,
                 "phewas_A1_flipped": phewas_A1_flipped,
-                "se_pqtl": se,
-                "p_pqtl": P,
                 "df_phewas": df_phewas,
             }
 
+        # define how many of the original cis-MR instruments were found in FinnGen
+        n_instruments_original = n_cis_mr_instruments
+        n_instruments_available = len(signal_phewas)
+        missing_snps = sorted(set(instrument_snps) - set(signal_phewas.keys()))
+        instrument_completeness = (
+            n_instruments_available / n_instruments_original
+        )
 
-        if len(signal_phewas) == 0:
-            print(f"[TRACKING] No COJO-selected SNPs could be queried for {protein}...")
+        if n_instruments_available == 0:
+            print(
+                f"[TRACKING] No cis-MR instruments found in FinnGen "
+                f"for {protein}..."
+            )
             continue
 
+        if n_instruments_available < n_instruments_original:
+            print(
+                f"[TRACKING] Using available FinnGen instruments for "
+                f"{protein}: {n_instruments_available}/"
+                f"{n_instruments_original}; "
+                f"missing={missing_snps}..."
+            )
 
-        # THIS IS IF SNP == 1 FOR COJO RESULT AT A GIVEN TARGET
-        if len(signal_phewas) == 1:
+        protein_results = []
+
+        # THIS IS IF SNP == 1 FOR AVAILABLE cis-MR INSTRUMENTS AT A GIVEN TARGET
+        if n_instruments_available == 1:
             signal = list(signal_phewas.values())[0]
-            rsid = signal["rsid"]
-            snp = signal["snp"]
-            A1 = signal["A1"]
-            A2 = signal["A2"]
-            gwas_beta = signal["gwas_beta"]
-            finngen_ref = signal["finngen_ref"]
-            finngen_alt = signal["finngen_alt"]
-            pqtl_effect_allele = signal["pqtl_effect_allele_original"]
-            pqtl_other_allele = signal["pqtl_other_allele_original"]
-            beta_original = signal["beta_pqtl_original"]
-            beta = signal["beta_pqtl"]
-            pqtl_A1_flipped = signal["pqtl_A1_flipped"]
-            phewas_A1_flipped = signal["phewas_A1_flipped"]
-            se = signal["se_pqtl"]
-            P = signal["p_pqtl"]
-            df_phewas = signal["df_phewas"]
-            for pheno in df_phewas.iter_rows(named=True):
-                b = pheno["BETA"]
-                s = pheno["SE"]
+            for pheno in signal["df_phewas"].iter_rows(named=True):
                 res = PheWAS(
-                    B_Y=b,
-                    SE_Y=s,
-                    B_X=beta,
-                    SE_X=se
+                    B_Y=pheno["BETA"],
+                    SE_Y=pheno["SE"],
+                    B_X=signal["beta_exposure"],
+                    SE_X=signal["se_exposure"]
                 )
                 protein_results.append({
                     "protein": protein,
+                    "pqtl_dataset": pqtl_dataset,
                     "method": "Wald ratio",
+                    "n_instruments_original": n_instruments_original,
+                    "n_instruments_available": n_instruments_available,
                     "n_instruments": 1,
-                    "rsid": str(rsid),
-                    "snp": str(snp),
-                    "A1": str(A1),
-                    "A2": str(A2),
-                    "gwas_beta": str(gwas_beta),
-                    "finngen_ref": str(finngen_ref),
-                    "finngen_alt": str(finngen_alt),
-                    "pqtl_effect_allele_original": str(pqtl_effect_allele),
-                    "pqtl_other_allele_original": str(pqtl_other_allele),
-                    "beta_pqtl_original": str(beta_original),
-                    "beta_pqtl": str(beta),
-                    "pqtl_A1_flipped": str(pqtl_A1_flipped),
-                    "phewas_A1_flipped": str(phewas_A1_flipped),
-                    "se_pqtl": str(se),
-                    "p_pqtl": str(P),
+                    "missing_instruments": ",".join(missing_snps),
+                    "instrument_completeness": instrument_completeness,
+                    "rsid": signal["rsid"],
+                    "snp": signal["snp"],
+                    "A1": signal["A1"],
+                    "A2": signal["A2"],
+                    "ad_effect_allele_original": signal["ad_effect_allele_original"],
+                    "ad_other_allele_original": signal["ad_other_allele_original"],
+                    "beta_ad_original": str(signal["beta_ad_original"]),
+                    "beta_ad": str(signal["beta_ad"]),
+                    "ad_A1_flipped": str(signal["ad_A1_flipped"]),
+                    "exposure_effect_allele": signal["exposure_effect_allele"],
+                    "exposure_other_allele": signal["exposure_other_allele"],
+                    "finngen_ref": signal["finngen_ref"],
+                    "finngen_alt": signal["finngen_alt"],
+                    "beta_exposure_original": str(signal["beta_exposure_original"]),
+                    "beta_exposure": str(signal["beta_exposure"]),
+                    "exposure_A1_flipped": str(signal["exposure_A1_flipped"]),
+                    "se_exposure": str(signal["se_exposure"]),
+                    "p_exposure": str(signal["p_exposure"]),
+                    "phewas_A1_flipped": str(
+                        signal["phewas_A1_flipped"]
+                    ),
                     "beta_mr": res["wald_ratio"],
                     "se_mr": res["se_wald_ratio"],
                     "p_mr": res["P_nominal"],
-                    "beta_phewas": str(b),
-                    "se_phewas": str(s),
+                    "beta_phewas": str(pheno["BETA"]),
+                    "se_phewas": str(pheno["SE"]),
                     "p_phewas": str(pheno["P"]),
                     "PHENOCODE": pheno["PHENOCODE"],
                     "PHENOSTRING": pheno["PHENOSTRING"],
                     "CATEGORY": pheno["CATEGORY"],
                 })
 
-
-        # THIS IS IF SNP > 1 FOR COJO RESULT AT A GIVEN TARGET
+        # THIS IS IF SNP > 1 FOR AVAILABLE cis-MR INSTRUMENTS AT A GIVEN TARGET
         else:
             common_phenocodes = None
             # only run IVW on phenotypes which appear for every SNP
@@ -419,7 +448,7 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
 
             print(
                 f"[TRACKING] Number of common PheWAS outcomes across "
-                f"{len(signal_phewas)} independent SNPs for "
+                f"{len(signal_phewas)} cis-MR instruments for "
                 f"{protein}: {len(common_phenocodes)}..."
             )
 
@@ -430,21 +459,26 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                 instrument_snps = []
                 A1_values = []
                 A2_values = []
-                gwas_beta_values = []
+                ad_effect_alleles = []
+                ad_other_alleles = []
+                beta_ad_original_values = []
+                beta_ad_values = []
+                ad_A1_flipped_values = []
+                exposure_effect_alleles = []
+                exposure_other_alleles = []
                 finngen_refs = []
                 finngen_alts = []
-                pqtl_effect_alleles = []
-                pqtl_other_alleles = []
-                beta_pqtl_original_values = []
-                beta_pqtl_values = []
-                pqtl_A1_flipped_values = []
-                phewas_A1_flipped_values = []
-                se_pqtl_values = []
-                p_pqtl_values = []
+                beta_exposure_original_values = []
+                beta_exposure_values = []
+                exposure_A1_flipped_values = []
+                se_exposure_values = []
+                p_exposure_values = []
+                phewas_flipped_values = []
                 beta_phewas_values = []
                 se_phewas_values = []
                 p_phewas_values = []
                 phenotype_info = None
+
                 for signal in signal_phewas.values():
                     pheno = (
                         signal["df_phewas"]
@@ -455,37 +489,45 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                         continue
 
                     pheno = pheno.row(0, named=True)
-
                     exposure_rows.append({
                         "SNP": signal["rsid"],
-                        "BETA": signal["beta_pqtl"],
-                        "SE": signal["se_pqtl"],
+                        "BETA": signal["beta_exposure"],
+                        "SE": signal["se_exposure"],
                     })
-
                     outcome_rows.append({
                         "SNP": signal["rsid"],
                         "BETA": pheno["BETA"],
                         "SE": pheno["SE"],
                     })
-
                     instrument_rsids.append(signal["rsid"])
                     instrument_snps.append(signal["snp"])
                     A1_values.append(signal["A1"])
                     A2_values.append(signal["A2"])
-                    gwas_beta_values.append(signal["gwas_beta"])
+                    ad_effect_alleles.append(signal["ad_effect_allele_original"])
+                    ad_other_alleles.append(signal["ad_other_allele_original"])
+                    beta_ad_original_values.append(signal["beta_ad_original"])
+                    beta_ad_values.append(signal["beta_ad"])
+                    ad_A1_flipped_values.append(signal["ad_A1_flipped"])
+                    exposure_effect_alleles.append(signal["exposure_effect_allele"])
+                    exposure_other_alleles.append(signal["exposure_other_allele"])
                     finngen_refs.append(signal["finngen_ref"])
                     finngen_alts.append(signal["finngen_alt"])
-                    pqtl_effect_alleles.append(signal["pqtl_effect_allele_original"])
-                    pqtl_other_alleles.append(signal["pqtl_other_allele_original"])
-                    beta_pqtl_original_values.append(signal["beta_pqtl_original"])
-                    beta_pqtl_values.append(signal["beta_pqtl"])
-                    pqtl_A1_flipped_values.append(signal["pqtl_A1_flipped"])
-                    phewas_A1_flipped_values.append(signal["phewas_A1_flipped"])
-                    se_pqtl_values.append(signal["se_pqtl"])
-                    p_pqtl_values.append(signal["p_pqtl"])
+                    beta_exposure_original_values.append(
+                        signal["beta_exposure_original"]
+                    )
+                    beta_exposure_values.append(signal["beta_exposure"])
+                    exposure_A1_flipped_values.append(
+                        signal["exposure_A1_flipped"]
+                    )
+                    se_exposure_values.append(signal["se_exposure"])
+                    p_exposure_values.append(signal["p_exposure"])
+                    phewas_flipped_values.append(
+                        signal["phewas_A1_flipped"]
+                    )
                     beta_phewas_values.append(pheno["BETA"])
                     se_phewas_values.append(pheno["SE"])
                     p_phewas_values.append(pheno["P"])
+
                     if phenotype_info is None:
                         phenotype_info = {
                             "PHENOCODE": pheno["PHENOCODE"],
@@ -497,6 +539,10 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                 outcome_df = pl.DataFrame(outcome_rows)
 
                 if exposure_df.height < 2:
+                    print(
+                        f"[TRACKING] Incomplete IVW instrument set for "
+                        f"{protein} and {phenocode}..."
+                    )
                     continue
 
                 ivw_result, snp_results = mr.IVW(
@@ -512,36 +558,49 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                 ivw_result = ivw_result.row(0, named=True)
                 protein_results.append({
                     "protein": protein,
+                    "pqtl_dataset": pqtl_dataset,
                     "method": "IVW delta",
+                    "n_instruments_original": n_instruments_original,
+                    "n_instruments_available": n_instruments_available,
                     "n_instruments": ivw_result["N_SNPS"],
+                    "missing_instruments": ",".join(missing_snps),
+                    "instrument_completeness": instrument_completeness,
                     "rsid": ",".join(instrument_rsids),
                     "snp": ",".join(instrument_snps),
                     "A1": ",".join(A1_values),
                     "A2": ",".join(A2_values),
-                    "gwas_beta": ",".join(
-                        str(value) for value in gwas_beta_values
+                    "ad_effect_allele_original": ",".join(ad_effect_alleles),
+                    "ad_other_allele_original": ",".join(ad_other_alleles),
+                    "beta_ad_original": ",".join(
+                        str(value) for value in beta_ad_original_values
                     ),
+                    "beta_ad": ",".join(
+                        str(value) for value in beta_ad_values
+                    ),
+                    "ad_A1_flipped": ",".join(
+                        str(value) for value in ad_A1_flipped_values
+                    ),
+                    "exposure_effect_allele": ",".join(exposure_effect_alleles),
+                    "exposure_other_allele": ",".join(exposure_other_alleles),
                     "finngen_ref": ",".join(finngen_refs),
                     "finngen_alt": ",".join(finngen_alts),
-                    "pqtl_effect_allele_original": ",".join(pqtl_effect_alleles),
-                    "pqtl_other_allele_original": ",".join(pqtl_other_alleles),
-                    "beta_pqtl_original": ",".join(
-                        str(value) for value in beta_pqtl_original_values
+                    "beta_exposure_original": ",".join(
+                        str(value) for value in beta_exposure_original_values
                     ),
-                    "beta_pqtl": ",".join(
-                        str(value) for value in beta_pqtl_values
+                    "beta_exposure": ",".join(
+                        str(value) for value in beta_exposure_values
                     ),
-                    "pqtl_A1_flipped": ",".join(
-                        str(value) for value in pqtl_A1_flipped_values
+                    "exposure_A1_flipped": ",".join(
+                        str(value) for value in exposure_A1_flipped_values
+                    ),
+                    "se_exposure": ",".join(
+                        str(value) for value in se_exposure_values
+                    ),
+                    "p_exposure": ",".join(
+                        str(value) for value in p_exposure_values
                     ),
                     "phewas_A1_flipped": ",".join(
-                        str(value) for value in phewas_A1_flipped_values
-                    ),
-                    "se_pqtl": ",".join(
-                        str(value) for value in se_pqtl_values
-                    ),
-                    "p_pqtl": ",".join(
-                        str(value) for value in p_pqtl_values
+                        str(value) for value in phewas_flipped_values
                     ),
                     "beta_mr": ivw_result["BETA"],
                     "se_mr": ivw_result["SE"],
@@ -560,14 +619,12 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
                     "CATEGORY": phenotype_info["CATEGORY"],
                 })
 
-
         if len(protein_results) == 0:
             print(f"[TRACKING] No Wald ratio / IVW estimates generated for {protein}...")
             continue
 
         df_protein_results = pl.DataFrame(protein_results)
-        # FDR correct across all phenotypes tested for this protein regardless of method
-        # rejected, q = fdrcorrection(df_protein_results["p_mr"].to_numpy(), alpha=0.05, method="indep")
+        # Bonferroni correct across all predefined FinnGen ICD endpoints for this protein
         df_protein_results = df_protein_results.with_columns([
             pl.min_horizontal(
                 pl.col("p_mr") * finngen_icd_endpoints,
@@ -586,21 +643,25 @@ def phewas_for_compelling_targets(pheno_id: str, pqtl_dataset: str, eqtl_dataset
 
     df_results = pl.DataFrame(results, infer_schema_length=None)
     df_results = df_results.sort(["protein", "p_mr"])
-    df_results.write_csv(os.path.join(out_dir, f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"), separator="\t")
+    df_results.write_csv(
+        os.path.join(
+            out_dir,
+            f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
+        ),
+        separator="\t"
+    )
     print(f"[TRACKING] PheWAS completed: {df_results.height} associations saved...")
 
 
-# pheno_id: str, pqtl_dataset: str, eqtl_dataset: str
+# pheno_id: str, pqtl_dataset: str
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--pheno_id", required=True)
     p.add_argument("--pqtl_dataset", required=True)
-    p.add_argument("--eqtl_dataset", required=True)
     args = p.parse_args()
     phewas_for_compelling_targets(
         pheno_id=args.pheno_id,
-        pqtl_dataset=args.pqtl_dataset,
-        eqtl_dataset=args.eqtl_dataset
+        pqtl_dataset=args.pqtl_dataset
     )
 
 
