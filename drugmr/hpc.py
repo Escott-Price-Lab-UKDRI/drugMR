@@ -421,7 +421,7 @@ apptainer exec --bind "{remote}:/work" \\
 # RUN PHEWAS CHECKS FOR SAFETY (LOCALLY) -> API != WORK IN SLURM HPC
 # ******************************************************************
 
-def phewas_safety(
+def phewas_safety_finngen(
     pheno_id: str,
     pqtl_dataset: str,
     local_results_dir: str = "results",
@@ -449,23 +449,23 @@ def phewas_safety(
     )
 
     if phewas_out.exists() and phewas_out.stat().st_size > 0 and not overwrite:
-        print(f"[TRACKING] PheWAS safety analysis already completed: {phewas_out}")
-        print("[TRACKING] Skipping PheWAS safety analysis...")
+        print(f"[TRACKING] FinnGen PheWAS safety analysis already completed: {phewas_out}")
+        print("[TRACKING] Skipping FinnGen PheWAS safety analysis...")
         return
 
     if overwrite:
-        print("[TRACKING] Overwrite enabled - rerunning PheWAS safety analysis...")
+        print("[TRACKING] Overwrite enabled - rerunning FinnGen PheWAS safety analysis...")
     else:
-        print("[TRACKING] No existing PheWAS safety output found - running step...")
+        print("[TRACKING] No existing FinnGen PheWAS safety output found - running step...")
 
     if not top_snp_file.exists():
         raise FileNotFoundError(
-            f"PheWAS cannot run because pairwise COLOC output was not found: {top_snp_file}"
+            f"FinnGen PheWAS cannot run because pairwise COLOC output was not found: {top_snp_file}"
         )
 
     if top_snp_file.stat().st_size == 0:
         raise RuntimeError(
-            f"PheWAS cannot run because pairwise COLOC output is empty: {top_snp_file}"
+            f"FinnGen PheWAS cannot run because pairwise COLOC output is empty: {top_snp_file}"
         )
 
     phewas_out.parent.mkdir(parents=True, exist_ok=True)
@@ -478,10 +478,73 @@ python bin/phewas_cis_pqtls.py \\
   --pqtl_dataset {pqtl_dataset}
 """
 
-    print(f"[TRACKING] PheWAS pairwise COLOC input found: {top_snp_file}")
-    print("[TRACKING] Running PheWAS safety analysis locally...")
+    print(f"[TRACKING] FinnGen PheWAS pairwise COLOC input found: {top_snp_file}")
+    print("[TRACKING] Running FinnGen PheWAS safety analysis locally...")
     subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
-    print(f"[TRACKING] PheWAS safety results found: {phewas_out}")
+    print(f"[TRACKING] FinnGen PheWAS safety results found: {phewas_out}")
+
+
+def phewas_safety_ukbb(
+    pheno_id: str,
+    pqtl_dataset: str,
+    local_results_dir: str = "results",
+    overwrite: bool = False
+):
+    project_root = Path(__file__).resolve().parents[1]
+    local_results_dir = Path(local_results_dir)
+
+    if not local_results_dir.is_absolute():
+        local_results_dir = project_root / local_results_dir
+
+    top_snp_file = (
+        local_results_dir
+        / "coloc"
+        / pqtl_dataset
+        / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
+    )
+
+    phewas_out = (
+        local_results_dir
+        / "PheWAS_UKBB"
+        / pqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
+    )
+
+    if phewas_out.exists() and phewas_out.stat().st_size > 0 and not overwrite:
+        print(f"[TRACKING] UKBB PheWAS safety analysis already completed: {phewas_out}")
+        print("[TRACKING] Skipping UKBB PheWAS safety analysis...")
+        return
+
+    if overwrite:
+        print("[TRACKING] Overwrite enabled - rerunning UKBB PheWAS safety analysis...")
+    else:
+        print("[TRACKING] No existing UKBB PheWAS safety output found - running step...")
+
+    if not top_snp_file.exists():
+        raise FileNotFoundError(
+            f"UKBB PheWAS cannot run because pairwise COLOC output was not found: {top_snp_file}"
+        )
+
+    if top_snp_file.stat().st_size == 0:
+        raise RuntimeError(
+            f"UKBB PheWAS cannot run because pairwise COLOC output is empty: {top_snp_file}"
+        )
+
+    phewas_out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = f"""
+set -euo pipefail
+cd "{project_root}"
+python bin/ukb_phewas.py \\
+  --pheno_id {pheno_id} \\
+  --pqtl_dataset {pqtl_dataset}
+"""
+
+    print(f"[TRACKING] UKBB PheWAS pairwise COLOC input found: {top_snp_file}")
+    print("[TRACKING] Running UKBB PheWAS safety analysis locally...")
+    subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
+    print(f"[TRACKING] UKBB PheWAS safety results found: {phewas_out}")
 
 
 # ******************************************************************
@@ -862,8 +925,16 @@ def hpc(config: str = "assets/config.yaml"):
         overwrite=overwrite,
     )
 
-    print("[TRACKING] Running PheWAS safety analysis locally...")
-    phewas_safety(
+    print("[TRACKING] Running FinnGen PheWAS safety analysis locally...")
+    phewas_safety_finngen(
+        pheno_id=pheno_id,
+        pqtl_dataset=pqtl_dataset,
+        local_results_dir=local_results_dir,
+        overwrite=overwrite,
+    )
+
+    print("[TRACKING] Running UKBB PheWAS safety analysis locally...")
+    phewas_safety_ukbb(
         pheno_id=pheno_id,
         pqtl_dataset=pqtl_dataset,
         local_results_dir=local_results_dir,

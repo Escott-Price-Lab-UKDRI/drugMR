@@ -47,14 +47,22 @@ def check_cis_regions(cis_dir: Path, overwrite: bool = False):
         print("[TRACKING] No existing cis-region directory found - running step...")
         return False
 
-    # check whether any pQTL cis-regions actually exist
-    n_cis = len(list(cis_dir.glob("*/pqtl.parquet")))
+    # check whether complete pQTL + GWAS cis-regions actually exist
+    pqtl_loci = {file.parent.name for file in cis_dir.glob("*/pqtl.parquet")}
+    gwas_loci = {file.parent.name for file in cis_dir.glob("*/gwas.parquet")}
+    complete_loci = pqtl_loci.intersection(gwas_loci)
+    incomplete_loci = pqtl_loci.symmetric_difference(gwas_loci)
 
-    if n_cis == 0:
-        print("[CONCERN] cis-region directory exists but no pqtl.parquet files were found - rerunning step...")
+    if len(complete_loci) == 0:
+        print("[CONCERN] cis-region directory exists but no complete pQTL/GWAS loci were found - rerunning step...")
         return False
 
-    print(f"[TRACKING] cis-regions already completed: {n_cis} loci found")
+    if len(incomplete_loci) > 0:
+        print(f"[CONCERN] Found {len(incomplete_loci)} incomplete cis-region loci - rerunning step...")
+        print(f"[CONCERN] Example incomplete loci: {sorted(incomplete_loci)[:10]}")
+        return False
+
+    print(f"[TRACKING] cis-regions already completed: {len(complete_loci)} complete loci found")
     print("[TRACKING] Skipping cis-region preparation...")
     return True
 
@@ -228,6 +236,16 @@ def local(config: str = "assets/config.yaml"):
         / pheno_id
         / f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
     )
+
+    # phewas ukbb_out
+    phewas_ukbb_out = (
+        project_root
+        / "results"
+        / "PheWAS_UKBB"
+        / pqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
+    )
     
     # change this where NetworkMR saves its final compiled output
     network_mr_out = (
@@ -319,7 +337,7 @@ docker run --rm \\
 
     # mediators stuff
     if mediators:
-        print("[TRACKING] Qceing mediators locally via Docker...")
+        print("[TRACKING] QCing mediators locally via Docker...")
 
         mediator_args = f"--mediator-manifest {mediator_manifest}"
         if remove_mhc:
@@ -343,7 +361,7 @@ docker run --rm \\
         cmd_base(cmd_m_qc)
 
     else:
-        print("[TRACKING] No mediators specificed, running drugMR without them then!")
+        print("[TRACKING] No mediators specified, running drugMR without them then!")
 
     # cis-region module
     cmd_cis = f"""
@@ -365,14 +383,20 @@ docker run --rm \\
 
     print(f"[TRACKING] Checking cis-region output: {cis_dir}")
 
-    if not cis_dir.exists():
-        raise FileNotFoundError(f"cis-region directory not created: {cis_dir}")
+    pqtl_loci = {file.parent.name for file in cis_dir.glob("*/pqtl.parquet")}
+    gwas_loci = {file.parent.name for file in cis_dir.glob("*/gwas.parquet")}
+    complete_loci = pqtl_loci.intersection(gwas_loci)
+    incomplete_loci = pqtl_loci.symmetric_difference(gwas_loci)
+    print(f"[TRACKING] Complete cis-region loci generated: {len(complete_loci)}")
 
-    n_cis = len(list(cis_dir.glob("*/pqtl.parquet")))
-    print(f"[TRACKING] cis-region loci generated: {n_cis}")
+    if len(complete_loci) == 0:
+        raise RuntimeError("No complete cis-region files generated. Check pqtl_dir path.")
 
-    if n_cis == 0:
-        raise RuntimeError("No cis-region files generated. Check pqtl_dir path.")
+    if len(incomplete_loci) > 0:
+        raise RuntimeError(
+            f"{len(incomplete_loci)} incomplete cis-region loci found. "
+            f"Example loci: {sorted(incomplete_loci)[:10]}"
+        )
 
     # cis-MR module 
     cmd_mr = f"""
@@ -395,13 +419,7 @@ docker run --rm \\
 
     require_output(mr_out, "cis-MR", "COLOC")
 
-    # CMD COLOC TARGETS
-    # CMD RUN COLOC (Pairwise)
-    # Need to test
-
-
     # networkMR (HERE)
-        # networkMR
     if mediators:
         require_output(mr_out, "cis-MR", "NetworkMR")
 
@@ -501,7 +519,7 @@ docker run --rm \
         "pipeline completion"
     )
 
-    # PheWAS stuff
+    # PheWAS stuff (for FinnGen)
     cmd_phewas = f"""
 set -euo pipefail 
 docker run --rm \\
@@ -515,15 +533,38 @@ docker run --rm \\
 """
 
     # PheWAS depends on the pairwise COLOC results + cis-MR instruments
-    require_output(coloc_out, "COLOC", "PheWAS")
-    require_output(mr_instruments_out, "cis-MR instruments", "PheWAS")
+    require_output(coloc_out, "COLOC", "FinnGen PheWAS")
+    require_output(mr_instruments_out, "cis-MR instruments", "FinnGen PheWAS")
 
-    if not check_output(phewas_out, "PheWAS safety analysis", overwrite):
-        print("[TRACKING] Running PheWAS safety analysis locally...")
+    if not check_output(phewas_out, "PheWAS safety analysis on FinnGen", overwrite):
+        print("[TRACKING] Running PheWAS (FinnGen) safety analysis locally...")
         cmd_base(cmd_phewas)
 
-    require_output(phewas_out, "PheWAS safety analysis", "pipeline completion")
-    print(f"[TRACKING] PheWAS safety results found: {phewas_out}")
+    require_output(phewas_out, "PheWAS safety analysis for FinnGen", "pipeline completion")
+    print(f"[TRACKING] FinnGen PheWAS safety results found: {phewas_out}")
+
+
+    # PheWAS (for UKBB)
+    cmd_phewas_ukbb = f"""
+set -euo pipefail 
+docker run --rm \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/ukb_phewas.py \\
+    --pheno_id {pheno_id} \\
+    --pqtl_dataset {pqtl_dataset}
+"""
+
+    require_output(coloc_out, "COLOC", "UKBB PheWAS")
+    require_output(mr_instruments_out, "cis-MR instruments", "UKBB PheWAS")
+
+    if not check_output(phewas_ukbb_out, "PheWAS safety analysis on UKBB", overwrite):
+        print("[TRACKING] Running PheWAS (UKBB) safety analysis locally...")
+        cmd_base(cmd_phewas_ukbb)
+    require_output(phewas_ukbb_out, "PheWAS safety analysis for UKBB", "pipeline completion")
+    print(f"[TRACKING] UKBB PheWAS safety results found: {phewas_ukbb_out}")
 
     print(f"[TRACKING] cis-MR instruments found: {mr_instruments_out}")
     print(f"[TRACKING] Final harmonised target stats found: {target_stats_out}")

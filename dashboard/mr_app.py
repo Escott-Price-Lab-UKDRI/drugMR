@@ -103,6 +103,21 @@ def safe_nunique(df: pd.DataFrame, col: str):
     return df[col].nunique()
 
 
+def safe_median(df: pd.DataFrame, col: str, scientific: bool = False):
+    if df.empty or col not in df.columns:
+        return "NA"
+
+    values = pd.to_numeric(df[col], errors="coerce").dropna()
+
+    if values.empty:
+        return "NA"
+
+    if scientific:
+        return f"{values.median():.3e}"
+
+    return f"{values.median():.3f}"
+
+
 def standardise_columns(df: pd.DataFrame):
     df = df.copy()
 
@@ -119,24 +134,338 @@ def standardise_columns(df: pd.DataFrame):
 
 
 
+def prepare_phewas(df: pd.DataFrame):
+    if df.empty:
+        return df
+
+    df = df.rename(columns={
+        "PROTEIN": "protein",
+        "protein_id": "protein",
+        "PHENO_ID": "pheno_id",
+        "OUTCOME_TRAIT": "outcome_trait",
+        "PHENOCODE": "phenocode",
+        "PHENOSTRING": "phenostring",
+        "CATEGORY": "category",
+        "SNP": "snp",
+        "RSID": "rsid",
+        "METHOD": "method",
+        "N_INSTRUMENTS": "n_instruments",
+        "BETA_MR": "beta_mr",
+        "SE_MR": "se_mr",
+        "P_MR": "p_mr",
+        "P_FDR": "p_fdr",
+        "FDR_Q": "fdr_q",
+        "FDR_SIGNIFICANT": "fdr_significant",
+        "P_BONFERRONI": "p_bonferroni",
+        "BONFERRONI_SIGNIFICANT": "bonferroni_significant"
+    })
+
+    df = standardise_columns(df)
+
+    # A1/A2 already come from the original outcome GWAS
+    # do not overwrite them with PheWAS REF/ALT
+    for col in ["a1", "a2", "ukb_ref", "ukb_alt", "finngen_ref", "finngen_alt"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.upper()
+
+    for col in [
+        "n_instruments",
+        "n_instruments_original",
+        "n_instruments_available",
+        "instrument_completeness",
+        "beta_mr",
+        "se_mr",
+        "p_mr",
+        "p_fdr",
+        "fdr_q",
+        "p_bonferroni"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "fdr_significant" in df.columns:
+        df["fdr_significant"] = (
+            df["fdr_significant"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+    elif "fdr_q" in df.columns:
+        df["fdr_significant"] = df["fdr_q"].fillna(np.inf) <= 0.05
+    elif "p_fdr" in df.columns:
+        df["fdr_significant"] = df["p_fdr"].fillna(np.inf) <= 0.05
+
+    if "bonferroni_significant" in df.columns:
+        df["bonferroni_significant"] = (
+            df["bonferroni_significant"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+    elif "p_bonferroni" in df.columns:
+        df["bonferroni_significant"] = df["p_bonferroni"].fillna(np.inf) <= 0.05
+
+    return df
+
+
+def subset_phewas_outcome(df: pd.DataFrame, outcome: str):
+    if df.empty:
+        return df
+
+    if "outcome_trait" in df.columns:
+        return df[df["outcome_trait"] == outcome].copy()
+
+    if "pheno_id" in df.columns:
+        return df[df["pheno_id"] == outcome].copy()
+
+    return df.copy()
+
+
+def render_phewas_section(
+    phewas_outcome: pd.DataFrame,
+    mr_coloc_pass: pd.DataFrame,
+    source_name: str,
+    source_description: str,
+    n_endpoints: int,
+    pqtl_dataset: str,
+    outcome: str,
+    key_prefix: str
+):
+    st.subheader(f"{source_name} PheWAS safety and repurposing profile")
+
+    if phewas_outcome.empty:
+        st.info(f"No local {source_name} PheWAS safety results are available for this outcome.")
+        return
+
+    if "protein" not in phewas_outcome.columns:
+        st.error(f"The {source_name} PheWAS result file does not contain a protein column.")
+        return
+
+    phewas_targets = sorted(phewas_outcome["protein"].dropna().astype(str).unique())
+
+    if len(phewas_targets) == 0:
+        st.info(f"No proteins were found in the {source_name} PheWAS safety table.")
+        return
+
+    default_phewas_target = 0
+    prioritised_target_names = mr_coloc_pass["protein"].dropna().astype(str).unique().tolist()
+
+    for target in prioritised_target_names:
+        if target in phewas_targets:
+            default_phewas_target = phewas_targets.index(target)
+            break
+
+    target_col, target_info_col = st.columns([2, 1])
+
+    with target_col:
+        selected_phewas_target = st.selectbox(
+            "Target",
+            phewas_targets,
+            index=default_phewas_target,
+            key=f"{key_prefix}_selected_phewas_target"
+        )
+
+    with target_info_col:
+        st.metric("Targets with PheWAS results", len(phewas_targets))
+
+    target_phewas = phewas_outcome[
+        phewas_outcome["protein"].astype(str) == selected_phewas_target
+    ].copy()
+
+    p_col = "p_mr" if "p_mr" in target_phewas.columns else None
+    beta_col = "beta_mr" if "beta_mr" in target_phewas.columns else None
+    bonferroni_col = "p_bonferroni" if "p_bonferroni" in target_phewas.columns else None
+
+    if p_col is None or beta_col is None:
+        st.error(
+            f"The {source_name} PheWAS result file needs the MR effect column "
+            "(beta_mr) and the MR p-value column (p_mr)."
+        )
+        return
+
+    target_phewas = target_phewas[
+        target_phewas[p_col].notna() &
+        target_phewas[beta_col].notna() &
+        (target_phewas[p_col] > 0)
+    ].copy()
+
+    if target_phewas.empty:
+        st.info(f"No valid {source_name} PheWAS associations were found for {selected_phewas_target}.")
+        return
+
+    target_phewas["minus_log10_p"] = -np.log10(target_phewas[p_col])
+
+    if bonferroni_col is not None:
+        target_phewas["bonferroni_significant"] = target_phewas[bonferroni_col].fillna(np.inf) <= 0.05
+    elif "bonferroni_significant" not in target_phewas.columns:
+        target_phewas["bonferroni_significant"] = False
+
+    phenotype_col = "phenostring" if "phenostring" in target_phewas.columns else "phenocode"
+    category_col = "category" if "category" in target_phewas.columns else None
+    n_phenotypes = target_phewas[phenotype_col].nunique()
+    n_nominal = int((target_phewas[p_col] < 0.05).sum())
+    n_bonferroni = int(target_phewas["bonferroni_significant"].sum())
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric(f"{source_name} phenotypes tested", int(n_phenotypes))
+    metric2.metric("Nominal associations", n_nominal)
+    metric3.metric("Bonferroni-significant associations", n_bonferroni)
+
+    st.caption(
+        f"PheWAS MR estimates show the effect of genetically predicted protein abundance "
+        f"on each {source_description}. Wald ratio is used for targets with one available "
+        "cis-MR instrument and IVW is used for targets with > 1."
+    )
+
+    plot_kwargs = {
+        "data_frame": target_phewas,
+        "x": beta_col,
+        "y": "minus_log10_p",
+        "hover_name": phenotype_col,
+        "symbol": "bonferroni_significant",
+        "hover_data": {
+            beta_col: ":.4f",
+            p_col: ":.3e",
+            "minus_log10_p": False,
+            "bonferroni_significant": True
+        },
+        "labels": {
+            beta_col: "PheWAS MR beta",
+            "minus_log10_p": "-log10(PheWAS p-value)",
+            "bonferroni_significant": "Bonferroni significant"
+        },
+        "title": f"{source_name} PheWAS profile: {selected_phewas_target}",
+        "height": 600,
+        "template": "plotly_white"
+    }
+
+    if "phenocode" in target_phewas.columns:
+        plot_kwargs["hover_data"]["phenocode"] = True
+
+    if category_col is not None:
+        plot_kwargs["color"] = category_col
+        plot_kwargs["labels"][category_col] = f"{source_name} category"
+
+    st.divider()
+    st.subheader("Phenome-wide association landscape")
+
+    phewas_fig = px.scatter(**plot_kwargs)
+    phewas_fig.add_hline(y=-np.log10(0.05 / n_endpoints), line_dash="dash", line_color="grey")
+    phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
+    st.plotly_chart(phewas_fig, use_container_width=True)
+
+    st.subheader("Bonferroni-significant PheWAS associations")
+    top_phewas = target_phewas[target_phewas["bonferroni_significant"]].copy()
+    top_phewas = top_phewas.sort_values(bonferroni_col if bonferroni_col is not None else p_col, ascending=True)
+    top_phewas = top_phewas.sort_values(beta_col, ascending=True)
+
+    if top_phewas.empty:
+        st.info(
+            f"No {source_name} phenotype associations survive Bonferroni correction across "
+            f"{n_endpoints:,} endpoints for {selected_phewas_target}."
+        )
+    else:
+        top_plot_kwargs = {
+            "data_frame": top_phewas,
+            "x": beta_col,
+            "y": phenotype_col,
+            "hover_data": {
+                beta_col: ":.4f",
+                p_col: ":.3e",
+                "minus_log10_p": ":.3f"
+            },
+            "labels": {
+                beta_col: "PheWAS MR beta",
+                phenotype_col: ""
+            },
+            "title": "Bonferroni-significant PheWAS associations",
+            "height": max(450, 45 * len(top_phewas)),
+            "template": "plotly_white"
+        }
+
+        if "phenocode" in top_phewas.columns:
+            top_plot_kwargs["hover_data"]["phenocode"] = True
+
+        if category_col is not None:
+            top_plot_kwargs["color"] = category_col
+            top_plot_kwargs["labels"][category_col] = f"{source_name} category"
+
+        top_phewas_fig = px.scatter(**top_plot_kwargs)
+        top_phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
+        st.plotly_chart(top_phewas_fig, use_container_width=True)
+
+    phewas_cols = [
+        "protein",
+        "method",
+        "n_instruments_original",
+        "n_instruments_available",
+        "n_instruments",
+        "instrument_completeness",
+        "missing_instruments",
+        "rsid",
+        "snp",
+        "a1",
+        "a2",
+        "ukb_ref",
+        "ukb_alt",
+        "phenocode",
+        "phenostring",
+        "category",
+        "beta_mr",
+        "se_mr",
+        "p_mr",
+        "p_bonferroni",
+        "bonferroni_significant"
+    ]
+
+    phewas_cols = available_cols(target_phewas, phewas_cols)
+    significant_phewas = target_phewas[target_phewas["bonferroni_significant"]].copy()
+    significant_phewas = significant_phewas.sort_values(bonferroni_col if bonferroni_col is not None else p_col, ascending=True)
+
+    if significant_phewas.empty:
+        st.success(
+            f"No {source_name} phenotype associations survive Bonferroni correction across "
+            f"{n_endpoints:,} endpoints for this target."
+        )
+    else:
+        st.dataframe(
+            significant_phewas[phewas_cols],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    with st.expander(f"View all {source_name} PheWAS associations"):
+        remaining_cols = [col for col in target_phewas.columns if col not in phewas_cols]
+        st.dataframe(
+            target_phewas[phewas_cols + remaining_cols].sort_values(p_col, ascending=True),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    st.download_button(
+        label=f"Download {selected_phewas_target} {source_name} PheWAS results",
+        data=target_phewas.to_csv(index=False, sep="\t"),
+        file_name=f"{selected_phewas_target}_{outcome}_{source_name.replace(' ', '_')}_PheWAS.tsv",
+        mime="text/tab-separated-values",
+        key=f"{key_prefix}_download_phewas_{pqtl_dataset}_{outcome}_{selected_phewas_target}",
+        use_container_width=True
+    )
+
+
 def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str):
     mr_table = "cis_mr_results"
     coloc_table = "coloc_results"
-    phewas_table = "phewas_safety"
+    finngen_phewas_table = "finngen_phewas_safety"
+    ukb_phewas_table = "ukb_phewas_safety"
 
     # main aesthetics
-    st.set_page_config(page_title=f"{db_name}", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .block-container {padding-top: 2rem; padding-bottom: 3rem;}
-        [data-testid="stMetric"] {border: 1px solid rgba(49, 51, 63, 0.15); border-radius: 10px; padding: 14px 16px;}
-        [data-testid="stDataFrame"] {border: 1px solid rgba(49, 51, 63, 0.12); border-radius: 10px; overflow: hidden;}
-        div[data-baseweb="select"] > div {border-radius: 8px;}
-        </style>
-        """,
-        unsafe_allow_html=True
+    # native Streamlit only - no HTML or CSS
+    st.set_page_config(
+        page_title=f"{db_name}",
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
+
     conn = st.connection("postgresql", type="sql", url=f"postgresql://localhost:{port_number}/{db_name}")
 
     # pQTL dataset selection schema 
@@ -191,7 +520,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
             ]
         )
 
-        phewas_file = project_dir / "results" / "PheWAS" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_PheWAS.tsv"
+        finngen_phewas_file = project_dir / "results" / "PheWAS" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_PheWAS.tsv"
+        ukb_phewas_file = project_dir / "results" / "PheWAS_UKBB" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_PheWAS.tsv"
         target_info_file = project_dir / "results" / "target_stats" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_top_cis_hits.tsv"
 
         required_files = [
@@ -204,7 +534,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
             dataset_result_files[dataset_id] = {
                 "mr": mr_file,
                 "coloc": coloc_file,
-                "phewas": phewas_file,
+                "finngen_phewas": finngen_phewas_file,
+                "ukb_phewas": ukb_phewas_file,
                 "target_info": target_info_file
             }
 
@@ -219,29 +550,43 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
 
     available_dataset_names = [dataset_names[dataset_id] for dataset_id in available_datasets]
     default_dataset_name = dataset_names[pqtl_dataset]
-    selected_dataset_name = st.segmented_control(
-        "pQTL dataset",
-        available_dataset_names,
-        default=default_dataset_name,
-        selection_mode="single",
-        key="pqtl_dataset_selector"
-    )
+
+    st.title(f"{db_name}")
+    st.caption("Genetically supported drug target discovery and clinical safety dashboard")
+
+    dataset_col, dataset_info_col = st.columns([2, 1])
+
+    with dataset_col:
+        selected_dataset_name = st.segmented_control(
+            "pQTL dataset",
+            available_dataset_names,
+            default=default_dataset_name,
+            selection_mode="single",
+            key="pqtl_dataset_selector"
+        )
 
     dataset_ids = {dataset_name: dataset_id for dataset_id, dataset_name in dataset_names.items()}
     pqtl_dataset = dataset_ids[selected_dataset_name]
     dataset_name = dataset_names[pqtl_dataset]
     dataset_n = dataset_ns[pqtl_dataset]
 
+    with dataset_info_col:
+        st.metric("pQTL sample size", f"{dataset_n:,}")
+
+    st.divider()
+
     # corresponding selected dataset result files
     mr_file = dataset_result_files[pqtl_dataset]["mr"]
     coloc_file = dataset_result_files[pqtl_dataset]["coloc"]
-    phewas_file = dataset_result_files[pqtl_dataset]["phewas"]
+    finngen_phewas_file = dataset_result_files[pqtl_dataset]["finngen_phewas"]
+    ukb_phewas_file = dataset_result_files[pqtl_dataset]["ukb_phewas"]
     target_info_file = dataset_result_files[pqtl_dataset]["target_info"]
 
     # load local result files into PostgreSQL for the dashboard
     mr = load_required_tsv(mr_file, "cis-MR")
     coloc = load_required_tsv(coloc_file, "pQTL–GWAS COLOC")
-    phewas = load_optional_tsv(phewas_file, "PheWAS safety")
+    finngen_phewas = load_optional_tsv(finngen_phewas_file, "FinnGen PheWAS safety")
+    ukb_phewas = load_optional_tsv(ukb_phewas_file, "UKB PheWAS safety")
     target_info = load_optional_tsv(target_info_file, "Harmonised target information")
 
     # standardise MR + pQTL COLOC columns before loading into PostgreSQL
@@ -274,18 +619,24 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
     mr.to_sql(mr_table, conn.engine, if_exists="replace", index=False)
     coloc.to_sql(coloc_table, conn.engine, if_exists="replace", index=False)
 
-    phewas_available = not phewas.empty
+    finngen_phewas_available = not finngen_phewas.empty
+    ukb_phewas_available = not ukb_phewas.empty
 
-    if phewas_available:
-        phewas.to_sql(phewas_table, conn.engine, if_exists="replace", index=False)
+    if finngen_phewas_available:
+        finngen_phewas.to_sql(finngen_phewas_table, conn.engine, if_exists="replace", index=False)
+
+    if ukb_phewas_available:
+        ukb_phewas.to_sql(ukb_phewas_table, conn.engine, if_exists="replace", index=False)
 
     with st.sidebar.expander("Tracking", expanded=False):
         st.write(f"Loaded {len(mr)} rows into {mr_table}")
         st.write(f"Loaded {len(coloc)} rows into {coloc_table}")
 
+        if finngen_phewas_available:
+            st.write(f"Loaded {len(finngen_phewas)} rows into {finngen_phewas_table}")
 
-        if phewas_available:
-            st.write(f"Loaded {len(phewas)} rows into {phewas_table}")
+        if ukb_phewas_available:
+            st.write(f"Loaded {len(ukb_phewas)} rows into {ukb_phewas_table}")
 
         if not target_info.empty:
             st.write(f"Loaded {len(target_info)} harmonised top cis-hit rows")
@@ -294,79 +645,15 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
     mr = conn.query(f"SELECT * FROM {mr_table};", ttl=0)
     coloc = conn.query(f"SELECT * FROM {coloc_table};", ttl=0)
 
-
-    if phewas_available:
-        phewas = conn.query(f"SELECT * FROM {phewas_table};", ttl=0)
+    if finngen_phewas_available:
+        finngen_phewas = prepare_phewas(conn.query(f"SELECT * FROM {finngen_phewas_table};", ttl=0))
     else:
-        phewas = pd.DataFrame()
+        finngen_phewas = pd.DataFrame()
 
-    # make PheWAS columns consistent
-    if not phewas.empty:
-        phewas = phewas.rename(columns={
-            "PROTEIN": "protein",
-            "protein_id": "protein",
-            "PHENO_ID": "pheno_id",
-            "OUTCOME_TRAIT": "outcome_trait",
-            "PHENOCODE": "phenocode",
-            "PHENOSTRING": "phenostring",
-            "CATEGORY": "category",
-            "SNP": "snp",
-            "RSID": "rsid",
-            "METHOD": "method",
-            "N_INSTRUMENTS": "n_instruments",
-            "BETA_MR": "beta_mr",
-            "SE_MR": "se_mr",
-            "P_MR": "p_mr",
-            "P_FDR": "p_fdr",
-            "FDR_Q": "fdr_q",
-            "FDR_SIGNIFICANT": "fdr_significant",
-            "P_BONFERRONI": "p_bonferroni",
-            "BONFERRONI_SIGNIFICANT": "bonferroni_significant"
-        })
-
-        phewas = standardise_columns(phewas)
-
-        # A1/A2 already come from the original outcome GWAS
-        # do not overwrite them with FinnGen ALT/REF
-        if "a1" in phewas.columns:
-            phewas["a1"] = phewas["a1"].astype(str).str.upper()
-
-        if "a2" in phewas.columns:
-            phewas["a2"] = phewas["a2"].astype(str).str.upper()
-
-        for col in [
-            "n_instruments",
-            "beta_mr",
-            "se_mr",
-            "p_mr",
-            "p_fdr",
-            "fdr_q",
-            "p_bonferroni"
-        ]:
-            if col in phewas.columns:
-                phewas[col] = pd.to_numeric(phewas[col], errors="coerce")
-
-        if "fdr_significant" in phewas.columns:
-            phewas["fdr_significant"] = (
-                phewas["fdr_significant"]
-                .astype(str)
-                .str.lower()
-                .isin(["true", "1", "yes"])
-            )
-        elif "fdr_q" in phewas.columns:
-            phewas["fdr_significant"] = phewas["fdr_q"].fillna(np.inf) <= 0.05
-        elif "p_fdr" in phewas.columns:
-            phewas["fdr_significant"] = phewas["p_fdr"].fillna(np.inf) <= 0.05
-
-        if "bonferroni_significant" in phewas.columns:
-            phewas["bonferroni_significant"] = (
-                phewas["bonferroni_significant"]
-                .astype(str)
-                .str.lower()
-                .isin(["true", "1", "yes"])
-            )
-        elif "p_bonferroni" in phewas.columns:
-            phewas["bonferroni_significant"] = phewas["p_bonferroni"].fillna(np.inf) <= 0.05
+    if ukb_phewas_available:
+        ukb_phewas = prepare_phewas(conn.query(f"SELECT * FROM {ukb_phewas_table};", ttl=0))
+    else:
+        ukb_phewas = pd.DataFrame()
 
     # MR ammenities
     # standardise numeric MR columns
@@ -506,15 +793,26 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
     default_outcome = outcomes.index(phenotype) if phenotype in outcomes else 0
 
     # sidebar filters
-    outcome = st.sidebar.selectbox("Outcome", outcomes, index=default_outcome)
-    fdr = st.sidebar.slider("MR FDR threshold", 0.0, 1.0, 0.05, 0.01)
-    q_pval = st.sidebar.slider("Minimum Cochran Q p-value", 0.0, 1.0, 0.05, 0.01)
-    pp4 = st.sidebar.slider("pQTL–GWAS COLOC PP.H4 threshold", 0.0, 1.0, 0.70, 0.01)
-    protein = st.sidebar.text_input("Protein search")
-    st.title(f"{db_name}: {dataset_name} (N={dataset_n:,}) → {outcome}")
+    st.sidebar.title("Dashboard controls")
+    st.sidebar.caption(f"{dataset_name} → {phenotype}")
 
+    with st.sidebar.expander("Analysis selection", expanded=True):
+        outcome = st.selectbox("Outcome", outcomes, index=default_outcome)
+
+    with st.sidebar.expander("Target prioritisation thresholds", expanded=True):
+        fdr = st.slider("MR FDR threshold", 0.0, 1.0, 0.05, 0.01)
+        q_pval = st.slider("Minimum Cochran Q p-value", 0.0, 1.0, 0.05, 0.01)
+        pp4 = st.slider("pQTL–GWAS COLOC PP.H4 threshold", 0.0, 1.0, 0.70, 0.01)
+
+    with st.sidebar.expander("Protein filter", expanded=True):
+        protein = st.text_input(
+            "Protein search",
+            placeholder="e.g. PILRA, APOE or Q9UKJ1"
+        )
+
+    st.header(f"{dataset_name} → {outcome}")
     st.caption(
-        f"MR FDR ≤ {fdr:.2f} | Q p ≥ {q_pval:.2f} | "
+        f"N = {dataset_n:,} | MR FDR ≤ {fdr:.2f} | Q p ≥ {q_pval:.2f} | "
         f"pQTL–GWAS PP.H4 ≥ {pp4:.2f}"
     )
 
@@ -522,15 +820,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
     mr_outcome = mr[mr["outcome_trait"] == outcome].copy()
     coloc_outcome = coloc[coloc["outcome_trait"] == outcome].copy()
 
-    if not phewas.empty:
-        phewas_outcome = phewas.copy()
-
-        if "outcome_trait" in phewas_outcome.columns:
-            phewas_outcome = phewas_outcome[phewas_outcome["outcome_trait"] == outcome].copy()
-        elif "pheno_id" in phewas_outcome.columns:
-            phewas_outcome = phewas_outcome[phewas_outcome["pheno_id"] == outcome].copy()
-    else:
-        phewas_outcome = pd.DataFrame()
+    finngen_phewas_outcome = subset_phewas_outcome(finngen_phewas, outcome)
+    ukb_phewas_outcome = subset_phewas_outcome(ukb_phewas, outcome)
 
     # STAGE 1
     # cis-MR supported proteins
@@ -612,7 +903,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
         mr_pass = filter_protein(mr_pass, protein)
         coloc_pass = filter_protein(coloc_pass, protein)
         mr_coloc_pass = filter_protein(mr_coloc_pass, protein)
-        phewas_outcome = filter_protein(phewas_outcome, protein)
+        finngen_phewas_outcome = filter_protein(finngen_phewas_outcome, protein)
+        ukb_phewas_outcome = filter_protein(ukb_phewas_outcome, protein)
 
     # round coloc posterior probs
     for col in coloc_numeric_cols:
@@ -626,21 +918,30 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
     n_tested = safe_nunique(mr_outcome, "protein")
     n_mr = safe_nunique(mr_pass, "protein")
     n_mr_coloc = safe_nunique(mr_coloc_pass, "protein")
-    n_phewas = safe_nunique(phewas_outcome, "protein")
+    n_finngen_phewas = safe_nunique(finngen_phewas_outcome, "protein")
+    n_ukb_phewas = safe_nunique(ukb_phewas_outcome, "protein")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Overview",
-        "cis-MR results",
-        "pQTL–GWAS COLOC",
-        "Clinical PheWAS"
+        "1. cis-MR",
+        "2. pQTL–GWAS COLOC",
+        "3. FinnGen PheWAS",
+        "4. UKB PheWAS"
     ])
 
     with tab1:
         st.subheader("Target prioritisation")
+        st.caption(
+            "Targets move from cis-MR testing to MR support and then to shared pQTL–GWAS "
+            "causal signal support through pairwise COLOC."
+        )
+
         metric1, metric2, metric3 = st.columns(3)
         metric1.metric("Proteins tested by cis-MR", n_tested)
         metric2.metric("cis-MR supported", n_mr, f"{retention(n_mr, n_tested):.1f}% of tested", delta_color="off")
         metric3.metric("cis-MR + pQTL COLOC", n_mr_coloc, f"{retention(n_mr_coloc, n_mr):.1f}% retained", delta_color="off")
+
+        st.divider()
 
         funnel_df = pd.DataFrame({
             "stage": [
@@ -667,10 +968,15 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
             template="plotly_white"
         )
 
-        funnel_fig.update_yaxes(categoryorder="array", categoryarray=funnel_df["stage"][::-1])
+        funnel_fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=funnel_df["stage"][::-1]
+        )
         funnel_fig.update_traces(textposition="outside")
+        funnel_fig.update_layout(showlegend=False, margin=dict(l=20, r=40, t=60, b=20))
         st.plotly_chart(funnel_fig, use_container_width=True)
 
+        st.divider()
         st.subheader("Prioritised targets")
 
         if not mr_coloc_pass.empty:
@@ -770,19 +1076,27 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
                 data=overview_table.to_csv(index=False, sep="\t"),
                 file_name=f"{pqtl_dataset}_{outcome}_prioritised_target_overview.tsv",
                 mime="text/tab-separated-values",
-                key="download_prioritised_targets_overview"
+                key="download_prioritised_targets_overview",
+                use_container_width=True
             )
 
         else:
             st.info("No proteins currently pass both the selected cis-MR and pQTL COLOC thresholds.")
 
-        if phewas_available:
+        if finngen_phewas_available or ukb_phewas_available:
             st.caption(
-                f"PheWAS safety results are available for {n_phewas} unique target(s)."
+                f"FinnGen PheWAS results are available for {n_finngen_phewas} unique target(s); "
+                f"UKB PheWAS results are available for {n_ukb_phewas} unique target(s)."
             )
 
     with tab2:
-        show_all_mr = st.checkbox("Show all tested cis-MR proteins", value=False)
+        st.subheader("cis-MR results")
+        st.caption(
+            "Wald ratio is used for proteins with one instrument. IVW is used for proteins "
+            "with more than one instrument."
+        )
+
+        show_all_mr = st.toggle("Show all tested cis-MR proteins", value=False)
         mr_display = mr_outcome if show_all_mr else mr_pass
         n_ivw = (mr_display["mr_method"] == "IVW").sum()
         n_wald = (mr_display["mr_method"] == "Wald ratio").sum()
@@ -816,11 +1130,15 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
         display_cols = available_cols(mr_display, display_cols)
         remaining_cols = [col for col in mr_display.columns if col not in display_cols]
 
+        st.subheader("MR association table")
+
         st.dataframe(
             mr_display[display_cols + remaining_cols],
             use_container_width=True,
             hide_index=True
         )
+
+        st.divider()
 
         # primary MR volcano plot
         plot_df = mr_display[
@@ -830,6 +1148,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
         ].copy()
 
         if not plot_df.empty:
+            st.subheader("MR effect landscape")
+
             plot_df["minus_log10_mr_pval"] = -np.log10(plot_df["mr_pval"])
             plot_df["significant"] = plot_df["mr_fdr_q"] < 0.05
 
@@ -874,8 +1194,8 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
         if not mr_coloc_pass.empty:
             col1, col2, col3 = st.columns(3)
             col1.metric("Prioritised proteins", mr_coloc_pass["protein"].nunique())
-            col2.metric("Median PP.H4", f"{mr_coloc_pass['pp_h4_abf'].median():.3f}" if "pp_h4_abf" in mr_coloc_pass.columns else "NA")
-            col3.metric("Median MR FDR", f"{mr_coloc_pass['mr_fdr_q'].median():.3e}" if "mr_fdr_q" in mr_coloc_pass.columns else "NA")
+            col2.metric("Median PP.H4", safe_median(mr_coloc_pass, "pp_h4_abf"))
+            col3.metric("Median MR FDR", safe_median(mr_coloc_pass, "mr_fdr_q", scientific=True))
 
             prioritised_cols = [
                 "protein",
@@ -905,6 +1225,9 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
                     na_position="last"
                 )
 
+            st.divider()
+            st.subheader("Prioritised target table")
+
             st.dataframe(
                 mr_coloc_pass[prioritised_cols + remaining_cols],
                 use_container_width=True,
@@ -916,243 +1239,36 @@ def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str)
                 data=mr_coloc_pass.to_csv(index=False, sep="\t"),
                 file_name=f"{outcome}_prioritised_targets.tsv",
                 mime="text/tab-separated-values",
-                key="download_prioritised_targets_coloc"
+                key="download_prioritised_targets_coloc",
+                use_container_width=True
             )
 
         else:
             st.info("No proteins currently pass both the selected cis-MR and pQTL COLOC thresholds.")
 
     with tab4:
-        st.subheader("FinnGen PheWAS safety and repurposing profile")
+        render_phewas_section(
+            phewas_outcome=finngen_phewas_outcome,
+            mr_coloc_pass=mr_coloc_pass,
+            source_name="FinnGen",
+            source_description="FinnGen phenotype (ICD coded)",
+            n_endpoints=2511,
+            pqtl_dataset=pqtl_dataset,
+            outcome=outcome,
+            key_prefix="finngen"
+        )
 
-        if phewas_outcome.empty:
-            st.info("No local PheWAS safety results are available for this outcome.")
-
-        elif "protein" not in phewas_outcome.columns:
-            st.error("The PheWAS result file does not contain a protein column.")
-
-        else:
-            phewas_targets = sorted(phewas_outcome["protein"].dropna().astype(str).unique())
-
-            if len(phewas_targets) == 0:
-                st.info("No proteins were found in the PheWAS safety table.")
-
-            else:
-                default_phewas_target = 0
-                prioritised_target_names = mr_coloc_pass["protein"].dropna().astype(str).unique().tolist()
-
-                for target in prioritised_target_names:
-                    if target in phewas_targets:
-                        default_phewas_target = phewas_targets.index(target)
-                        break
-
-                selected_phewas_target = st.selectbox(
-                    "Target",
-                    phewas_targets,
-                    index=default_phewas_target,
-                    key="selected_phewas_target"
-                )
-
-                target_phewas = phewas_outcome[
-                    phewas_outcome["protein"].astype(str) == selected_phewas_target
-                ].copy()
-
-                p_col = None
-                beta_col = None
-                bonferroni_col = None
-
-                for col in ["p_mr"]:
-                    if col in target_phewas.columns:
-                        p_col = col
-                        break
-
-                for col in ["beta_mr"]:
-                    if col in target_phewas.columns:
-                        beta_col = col
-                        break
-
-                for col in ["p_bonferroni"]:
-                    if col in target_phewas.columns:
-                        bonferroni_col = col
-                        break
-
-                if p_col is None or beta_col is None:
-                    st.error(
-                        "The PheWAS result file needs the MR effect column "
-                        "(beta_mr) and the MR p-value column "
-                        "(p_mr)."
-                    )
-
-                else:
-                    target_phewas = target_phewas[
-                        target_phewas[p_col].notna() &
-                        target_phewas[beta_col].notna() &
-                        (target_phewas[p_col] > 0)
-                    ].copy()
-
-                    if target_phewas.empty:
-                        st.info(f"No valid PheWAS associations were found for {selected_phewas_target}.")
-
-                    else:
-                        target_phewas["minus_log10_p"] = -np.log10(target_phewas[p_col])
-
-                        if bonferroni_col is not None:
-                            target_phewas["bonferroni_significant"] = target_phewas[bonferroni_col].fillna(np.inf) <= 0.05
-                        elif "bonferroni_significant" not in target_phewas.columns:
-                            target_phewas["bonferroni_significant"] = False
-
-                        phenotype_col = "phenostring" if "phenostring" in target_phewas.columns else "phenocode"
-                        category_col = "category" if "category" in target_phewas.columns else None
-
-                        n_phenotypes = target_phewas[phenotype_col].nunique()
-                        n_nominal = int((target_phewas[p_col] < 0.05).sum())
-                        n_bonferroni = int(target_phewas["bonferroni_significant"].sum())
-
-                        metric1, metric2, metric3 = st.columns(3)
-                        metric1.metric("FinnGen phenotypes tested", int(n_phenotypes))
-                        metric2.metric("Nominal associations", n_nominal)
-                        metric3.metric("Bonferroni-significant associations", n_bonferroni)
-                        
-                        st.caption(
-                            "PheWAS MR estimates show the effect of genetically predicted protein abundance "
-                            "on each FinnGen phenotype (ICD coded). Wald ratio is used for targets with "
-                            "one available cis-MR instrument and IVW is used for targets with > 1."
-                        )
-
-                        plot_kwargs = {
-                            "data_frame": target_phewas,
-                            "x": beta_col,
-                            "y": "minus_log10_p",
-                            "hover_name": phenotype_col,
-                            "symbol": "bonferroni_significant",
-                            "hover_data": {
-                                beta_col: ":.4f",
-                                p_col: ":.3e",
-                                "minus_log10_p": False,
-                                "bonferroni_significant": True
-                            },
-                            "labels": {
-                                beta_col: "PheWAS MR beta",
-                                "minus_log10_p": "-log10(PheWAS p-value)",
-                                "bonferroni_significant": "Bonferroni significant"
-                            },
-                            "title": f"FinnGen PheWAS profile: {selected_phewas_target}",
-                            "height": 600
-                        }
-
-                        if "phenocode" in target_phewas.columns:
-                            plot_kwargs["hover_data"]["phenocode"] = True
-
-                        if category_col is not None:
-                            plot_kwargs["color"] = category_col
-                            plot_kwargs["labels"][category_col] = "FinnGen category"
-
-                        phewas_fig = px.scatter(**plot_kwargs)
-                        phewas_fig.add_hline(y=-np.log10(0.05 / 2511), line_dash="dash", line_color="grey")
-                        phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
-                        st.plotly_chart(phewas_fig, use_container_width=True)
-
-                        st.subheader("Bonferroni-significant PheWAS associations")
-
-                        top_phewas = target_phewas[target_phewas["bonferroni_significant"]].copy()
-
-                        if bonferroni_col is not None:
-                            top_phewas = top_phewas.sort_values(bonferroni_col, ascending=True)
-                        else:
-                            top_phewas = top_phewas.sort_values(p_col, ascending=True)
-
-                        top_phewas = top_phewas.sort_values(beta_col, ascending=True)
-
-                        if top_phewas.empty:
-                            st.info(
-                                f"No FinnGen phenotype associations survive Bonferroni correction across "
-                                f"2,511 ICD endpoints for {selected_phewas_target}."
-                            )
-
-                        else:
-                            top_plot_kwargs = {
-                                "data_frame": top_phewas,
-                                "x": beta_col,
-                                "y": phenotype_col,
-                                "hover_data": {
-                                    beta_col: ":.4f",
-                                    p_col: ":.3e",
-                                    "minus_log10_p": ":.3f"
-                                },
-                                "labels": {
-                                    beta_col: "PheWAS MR beta",
-                                    phenotype_col: ""
-                                },
-                                "title": "Bonferroni-significant PheWAS associations",
-                                "height": max(450, 45 * len(top_phewas))
-                            }
-
-                            if "phenocode" in top_phewas.columns:
-                                top_plot_kwargs["hover_data"]["phenocode"] = True
-
-                            if category_col is not None:
-                                top_plot_kwargs["color"] = category_col
-                                top_plot_kwargs["labels"][category_col] = "FinnGen category"
-
-                            top_phewas_fig = px.scatter(**top_plot_kwargs)
-                            top_phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
-                            st.plotly_chart(top_phewas_fig, use_container_width=True)
-
-                        phewas_cols = [
-                            "protein",
-                            "method",
-                            "n_instruments",
-                            "rsid",
-                            "A1",
-                            "A2",
-                            "phenocode",
-                            "phenostring",
-                            "category",
-                            "beta_mr",
-                            "se_mr",
-                            "p_mr",
-                            "p_bonferroni",
-                            "bonferroni_significant"
-                        ]
-
-                        phewas_cols = [
-                            col for col in phewas_cols
-                            if col is not None and col in target_phewas.columns
-                        ]
-
-                        significant_phewas = target_phewas[
-                            target_phewas["bonferroni_significant"]
-                        ].copy()
-
-                        if bonferroni_col is not None:
-                            significant_phewas = significant_phewas.sort_values(bonferroni_col, ascending=True)
-                        else:
-                            significant_phewas = significant_phewas.sort_values(p_col, ascending=True)
-
-                        if significant_phewas.empty:
-                            st.success("No FinnGen phenotype associations survive Bonferroni correction across 2,511 ICD endpoints for this target.")
-                        else:
-                            st.dataframe(
-                                significant_phewas[phewas_cols],
-                                use_container_width=True,
-                                hide_index=True
-                            )
-
-                        with st.expander("View all PheWAS associations"):
-                            remaining_cols = [col for col in target_phewas.columns if col not in phewas_cols]
-                            st.dataframe(
-                                target_phewas[phewas_cols + remaining_cols].sort_values(p_col, ascending=True),
-                                use_container_width=True,
-                                hide_index=True
-                            )
-
-                        st.download_button(
-                            label=f"Download {selected_phewas_target} PheWAS results",
-                            data=target_phewas.to_csv(index=False, sep="\t"),
-                            file_name=f"{selected_phewas_target}_{outcome}_FinnGen_PheWAS.tsv",
-                            mime="text/tab-separated-values",
-                            key=f"download_phewas_{pqtl_dataset}_{outcome}_{selected_phewas_target}"
-                        )
+    with tab5:
+        render_phewas_section(
+            phewas_outcome=ukb_phewas_outcome,
+            mr_coloc_pass=mr_coloc_pass,
+            source_name="UKB TOPMed",
+            source_description="UK Biobank EHR-derived PheCode phenotype",
+            n_endpoints=1419,
+            pqtl_dataset=pqtl_dataset,
+            outcome=outcome,
+            key_prefix="ukb"
+        )
 
 
 def main():
