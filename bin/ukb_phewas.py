@@ -57,10 +57,7 @@ def grab_phewas_info(snp: str, rsid: str):
 def resolve_ukbb_variant(chromosome: str, position: int, A1: str, A2: str, rsid: str):
     snp_first_order = f"{chromosome}-{position}-{A1}-{A2}"
     snp_second_order = f"{chromosome}-{position}-{A2}-{A1}"
-    for snp, ukb_ref, ukb_alt in [
-        (snp_first_order, A1, A2),
-        (snp_second_order, A2, A1)
-    ]:
+    for snp, ukb_ref, ukb_alt in [(snp_first_order, A1, A2), (snp_second_order, A2, A1)]:
         try:
             response = requests.get(f"https://pheweb.org/UKB-TOPMed/api/variant/{snp}", timeout=60)
             if response.status_code != 200:

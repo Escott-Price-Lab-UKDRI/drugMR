@@ -15,6 +15,7 @@ from pathlib import Path
 decode_n = 35559
 ukb_ppp_n = 54219
 wu_csf_n = 3506
+wingo_brain_n = 1013
 
 # pre-established args from notebook
 # * pheno_id
@@ -51,6 +52,10 @@ def define_loci_from_cis_regions(pqtl_dataset: str, pheno_id: str, pqtl_dir: str
             df = df.with_columns(
                 pl.lit(wu_csf_n).alias("N")
             )
+        elif pqtl_dataset == "wingo_brain":
+            df = df.with_columns(
+                pl.lit(wingo_brain_n).alias("N")
+            )
         
         # pos
         chr = df.select(pl.col("CHR").cast(pl.Int64).unique()).item()
@@ -76,7 +81,7 @@ def define_loci_from_cis_regions(pqtl_dataset: str, pheno_id: str, pqtl_dir: str
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--pqtl_dataset", required=True, choices=["ukb_ppp", "decode", "wu_csf"])
+    p.add_argument("--pqtl_dataset", required=True, choices=["ukb_ppp", "decode", "wu_csf", "wingo_brain"])
     p.add_argument("--pheno_id", required=True)
     p.add_argument("--pqtl_dir", required=True)
     args = p.parse_args()

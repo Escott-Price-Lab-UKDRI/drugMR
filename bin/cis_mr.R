@@ -13,6 +13,13 @@
 # TO DO'S
 # MAKE A FUNCTION (WHICH WILL BE INHERITED WITHIN THE MR FUNCT) WHICH PER 1/N pQTL-MR -> adds an I or a symbol as kind of a progress bar
 
+# FIXED IN THIS VERSION
+# [1] n_instruments == 2 no longer silently dropped (was falling into the else -> next)
+# [2] Egger / WME gated on IV count via MIN_IV_EGGER and MIN_IV_WME
+#     (Egger needs residual df; InSIDE not defensible within one cis locus)
+# [3] phenotype_col was being passed a VALUE not a COLUMN NAME -> exposure name silently defaulted
+# [4] minimum detectable OR (MDE) reported per protein so nulls are interpretable
+
 suppressPackageStartupMessages({
   library(remotes)
   library(progress)
@@ -43,6 +50,12 @@ out_dir <- "./results/cis-MR"
 # MR params
 # clump_kb, clump_r2, clump_p1
 # pval thresh, f_stat thresh
+CLUMP_KB      <- 10000
+CLUMP_R2      <- 0.001
+PVAL_THRESH   <- 5e-8
+F_THRESH      <- 10
+MIN_IV_WME    <- 3
+MIN_IV_EGGER  <- 3
 
 # create outdir 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
@@ -53,7 +66,8 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
   supported_datasets <- c(
     "ukb_ppp",
     "decode",
-    "wu_csf"
+    "wu_csf",
+    "wingo_brain"
   )
   
   if (!pqtl_dataset %in% supported_datasets) {
@@ -77,6 +91,10 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
   
   if (pqtl_dataset == "wu_csf") {
     dataset_label <- "WU-CSF"
+  }
+
+  if (pqtl_dataset == "wingo_brain") {
+    dataset_label <- "Wingo_Brain"
   }
   
   protein_dirs <- list.dirs(
@@ -169,6 +187,11 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       df_pheno <- as.data.frame(df_pheno)
       print(dim(df_pheno))
       
+      # FIX [3] format_data expects phenotype_col to be a COLUMN NAME, not the value itself.
+      # Passing the protein string meant no such column existed -> silently defaulted to "exposure".
+      df$phenotype <- protein
+      df_pheno$phenotype <- pheno_id
+      
       exposure <- format_data(
         df,
         type              = "exposure",
@@ -180,7 +203,7 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         eaf_col           = "FRQ",
         pval_col          = "P",
         samplesize_col    = "N",
-        phenotype_col     = protein
+        phenotype_col     = "phenotype"
       )
       # check shape 
       dim(exposure)
@@ -196,7 +219,7 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         eaf_col           = "FRQ",
         pval_col          = "P",
         samplesize_col    = "N",
-        phenotype_col     = pheno_id
+        phenotype_col     = "phenotype"
       )
       # check shape
       dim(outcome)
@@ -204,14 +227,16 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # Relevance assumption ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      # NOTE F here is the squared z-statistic. With p < 5e-8 already imposed,
+      # z^2 is ~30 by construction, so F >= 10 is non-binding. Kept for documentation.
       exposure$pval.exposure <- as.numeric(exposure$pval.exposure)
-      exposure <- exposure[exposure$pval.exposure < 5e-8, ]
+      exposure <- exposure[exposure$pval.exposure < PVAL_THRESH, ]
       exposure <- exposure[
         exposure$eaf.exposure > 0.01 &
           exposure$eaf.exposure < 0.99,
       ]
       exposure$F <- (exposure$beta.exposure^2) / (exposure$se.exposure^2)
-      exposure <- exposure[exposure$F >= 10, ]
+      exposure <- exposure[exposure$F >= F_THRESH, ]
       
       print(paste0("[TRACKING] Instruments after p/F filters: ", nrow(exposure)))
       
@@ -234,8 +259,8 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
           {
             ld_clump(
               dat.clump,
-              clump_kb = 10000,
-              clump_r2 = 0.001,
+              clump_kb = CLUMP_KB,
+              clump_r2 = CLUMP_R2,
               plink_bin = Sys.which("plink"),
               # plink_bin = genetics.binaRies::get_plink_binary(),
               bfile = ref_bfile
@@ -261,8 +286,6 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         
         print(paste0("[TRACKING] Instruments after clumping: ", nrow(dat.clump)))
         
-        # HEREE ******* - SAVE as INSTRUMENTS.tsv (for that particular protein)
-        # Then save onto results/IVs/protein-wide .parquet file with instruments
       } else {
         print(paste0("No harmonised SNPs for ", protein))
         pb$tick(tokens = list(protein = protein))
@@ -272,6 +295,8 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       # Steiger filtering
       # Keep SNPs where R2_GX > R2_GY
+      # NOTE near-vacuous for cis-pQTLs given the variance-explained asymmetry.
+      # kept for documentation; reverse MR (AD -> protein) is the real directionality test.
       # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       
       dat.clump <- as.data.frame(dat.clump)
@@ -311,9 +336,13 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       instruments.temp[, pqtl_dataset := pqtl_dataset]
       instruments.temp[, outcome_trait := pheno_id]
       instruments.temp[, selection_method := "LD_CLUMP"]
-      instruments.temp[, clump_kb := 10000]
-      instruments.temp[, clump_r2 := 0.001]
+      instruments.temp[, clump_kb := CLUMP_KB]
+      instruments.temp[, clump_r2 := CLUMP_R2]
       instruments.temp[, used_in_mr := TRUE]
+      # z of the exposure effect -> sets the max r2 with a PAV that conditional
+      # analysis can resolve downstream: r2_max = 1 - (5.45/z)^2
+      instruments.temp[, z_exposure := beta.exposure / se.exposure]
+      instruments.temp[, r2_max_resolvable := 1 - (5.45 / abs(z_exposure))^2]
       instrument_cols <- c(
         "protein",
         "pqtl_dataset",
@@ -328,6 +357,8 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         "pval.exposure",
         "samplesize.exposure",
         "F",
+        "z_exposure",
+        "r2_max_resolvable",
         "effect_allele.outcome",
         "other_allele.outcome",
         "eaf.outcome",
@@ -362,16 +393,32 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       # ~~~~~~~~~~
       # run MR
       # ~~~~~~~~~~
-      if (nrow(dat.clump) >= 3) {
+      # FIX [1] n == 2 used to fall through to the else and get dropped entirely.
+      # FIX [2] method list now built from the IV count:
+      #   IVW    >= 2
+      #   WME    >= MIN_IV_WME    (breakdown point meaningless below this)
+      #   Egger  >= MIN_IV_EGGER  (needs residual df; InSIDE indefensible in one cis locus)
+      n_iv <- nrow(dat.clump)
+      
+      if (n_iv >= 2) {
+        
+        method_list <- c("mr_ivw")
+        
+        if (n_iv >= MIN_IV_WME) {
+          method_list <- c(method_list, "mr_weighted_median")
+        }
+        
+        if (n_iv >= MIN_IV_EGGER) {
+          method_list <- c(method_list, "mr_egger_regression")
+        }
+        
+        print(paste0("[TRACKING] n_IV = ", n_iv, " -> methods: ", paste(method_list, collapse = ", ")))
+        
         res.temp <- tryCatch(
           {
             mr(
               dat.clump,
-              method_list = c(
-                "mr_ivw",
-                "mr_egger_regression",
-                "mr_weighted_median"
-              )
+              method_list = method_list
             )
           },
           error = function(e) {
@@ -385,16 +432,24 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
           next
         }
         
-        res.pleio <- tryCatch(
-          {
-            mr_pleiotropy_test(dat.clump)
-          },
-          error = function(e) {
-            print(paste0("[CONCERN] Pleiotropy test failed for ", protein, " - ", e$message))
-            data.table(egger_intercept = NA_real_, pval = NA_real_)
-          }
-        )
+        # egger intercept only meaningful where egger itself was run
+        if (n_iv >= MIN_IV_EGGER) {
+          res.pleio <- tryCatch(
+            {
+              mr_pleiotropy_test(dat.clump)
+            },
+            error = function(e) {
+              print(paste0("[CONCERN] Pleiotropy test failed for ", protein, " - ", e$message))
+              data.table(egger_intercept = NA_real_, pval = NA_real_)
+            }
+          )
+        } else {
+          res.pleio <- data.table(egger_intercept = NA_real_, pval = NA_real_)
+        }
         
+        # Q is FLAGGED not used as a pass/fail gate - in cis, heterogeneity is
+        # usually allelic heterogeneity (multiple independent regulatory variants),
+        # not horizontal pleiotropy. and with 2-3 IVs it has no power anyway.
         res.het <- tryCatch(
           {
             mr_heterogeneity(dat.clump, method_list = c("mr_ivw"))
@@ -407,7 +462,7 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         
         res.temp <- data.table::as.data.table(res.temp)
         
-      } else if (nrow(dat.clump) == 1) {
+      } else if (n_iv == 1) {
         res.temp <- tryCatch(
           {
             mr(dat.clump, method_list = c("mr_wald_ratio"))
@@ -440,7 +495,8 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
       res.temp[, protein := protein]
       res.temp[, pqtl_dataset := pqtl_dataset]
       res.temp[, outcome_trait := pheno_id]
-      res.temp[, n_instruments := nrow(dat.clump)]
+      res.temp[, n_instruments := n_iv]
+      res.temp[, methods_run := paste(unique(gsub("^(b|se|pval)_", "", grep("^(b|se|pval)_", names(res.temp), value = TRUE))), collapse = ",")]
       res.temp[, egger_intercept := res.pleio$egger_intercept[1]]
       res.temp[, egger_intercept_pval := res.pleio$pval[1]]
       res.temp[, Q := res.het$Q[1]]
@@ -490,17 +546,32 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
            skip_absent = TRUE
   )
   
+  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  # FIX [4] minimum detectable effect
+  # OR detectable with 80% power at alpha = 0.05 given the primary SE.
+  # without this a null is uninterpretable - "no effect" vs "no power".
+  # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  all_results[, primary_beta := fifelse(!is.na(IVW_beta), IVW_beta, Wald_beta)]
+  all_results[, primary_se := fifelse(!is.na(IVW_se), IVW_se, Wald_se)]
+  all_results[, primary_pval := fifelse(!is.na(IVW_pval), IVW_pval, Wald_pval)]
+  all_results[, primary_method := fifelse(!is.na(IVW_beta), "IVW", "Wald ratio")]
+  # all_results[, MDE_OR := exp((1.96 + 0.84) * primary_se)]
+  
   # check whether FDR correct or not
+  # FDR is applied WITHIN this pQTL dataset only. cross-dataset agreement is
+  # treated as replication, not pooled into one testing family.
   if (length(protein_dirs) > 1) {
     if ("IVW_pval" %in% names(all_results)) {all_results[, IVW_FDR_q := p.adjust(IVW_pval, method = "fdr")]}
     if ("Egger_pval" %in% names(all_results)) {all_results[, Egger_FDR_q := p.adjust(Egger_pval, method = "fdr")]}
     if ("WME_pval" %in% names(all_results)) {all_results[, WME_FDR_q := p.adjust(WME_pval, method = "fdr")]}
     if ("Wald_pval" %in% names(all_results)) {all_results[, Wald_FDR_q := p.adjust(Wald_pval, method = "fdr")]}
+    if ("primary_pval" %in% names(all_results)) {all_results[, primary_FDR_q := p.adjust(primary_pval, method = "fdr")]}
   } else {
     if ("IVW_pval" %in% names(all_results)) {all_results[, IVW_FDR_q := IVW_pval]}
     if ("Egger_pval" %in% names(all_results)) {all_results[, Egger_FDR_q := Egger_pval]}
     if ("WME_pval" %in% names(all_results)) {all_results[, WME_FDR_q := WME_pval]}
     if ("Wald_pval" %in% names(all_results)) {all_results[, Wald_FDR_q := Wald_pval]}
+    if ("primary_pval" %in% names(all_results)) {all_results[, primary_FDR_q := primary_pval]}
   }
   
   keep_cols <- c(
@@ -508,6 +579,13 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
     "pqtl_dataset",
     "outcome_trait",
     "n_instruments",
+    "methods_run",
+    "primary_method",
+    "primary_beta",
+    "primary_se",
+    "primary_pval",
+    "primary_FDR_q",
+    # "MDE_OR",
     "IVW_beta",
     "IVW_se",
     "IVW_pval",
@@ -583,6 +661,11 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
     
   }
   
+  # instrument count distribution -> tells you immediately how often the
+  # multi-instrument branch actually fires under r2 < 0.001
+  print("[TRACKING] Instrument count distribution:")
+  print(table(all_results$n_instruments))
+  
   if (file.exists(out_file_running)) {
     print(
       paste0(
@@ -599,10 +682,6 @@ mr_function <- function(pqtl_dataset, pqtl_dir, pheno_id, pheno_gwas, ref_bfile,
         out_instruments_running
       )
     )
-  }
-  
-  if (file.exists(out_file_running)) {
-    print(paste0("Saved running MR results too: ", out_file_running))
   }
 }
 
