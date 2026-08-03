@@ -6,7 +6,7 @@ from .config import Config
 from .phewas import PheWAS
 # from .cojo import COJO
 from .twosamplemr import PyTwoSampleMR
-from .utils import filter_mr_targets
+from .utils import filter_mr_targets, impute_ld
 
 __all__ = [
     "NetworkMR",
@@ -15,5 +15,6 @@ __all__ = [
     "PheWAS",
     # "COJO",
     "PyTwoSampleMR",
-    "filter_mr_targets"
+    "filter_mr_targets",
+    "impute_ld"
 ]
