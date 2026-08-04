@@ -26,9 +26,8 @@ def filter_mr_targets(df: pl.DataFrame):
 
 def impute_ld(ref_bfile, snp_1, snp_2):
     cmd = f"""
-set -euo pipefail 
 plink \
     --bfile {ref_bfile} \
     --ld {snp_1} {snp_2}
 """
-    subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
+    return subprocess.run(cmd, shell=True, check=False, executable="/bin/bash", capture_output=True, text=True)
