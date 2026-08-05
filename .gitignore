@@ -3,6 +3,7 @@
 .nextflow/
 dat/
 ref/
+analysis/
 containers/
 jupyter/
 tests/

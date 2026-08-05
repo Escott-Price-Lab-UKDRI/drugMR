@@ -1,219 +1,794 @@
 #!/usr/bin/env python3
 import argparse
-import subprocess
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from sqlalchemy import inspect
+
+# shared plotting conventions so charts look consistent across tabs rather than each
+# px.* call picking its own default palette
+SIGNIFICANCE_COLOR_MAP = {True: "#d62728", False: "#7f7f7f"}  # red = significant, grey = not
+SEQUENTIAL_SCALE = "Viridis"  # continuous significance / intensity scale
 
 
-# KEY CHANGES DOWN THE LINE WITH MORE PQTL DATASETS 
-# -> CHANGE THE DASHBOARD FUNCT TO ADD EQTL AND PQL ARGS
+# KEY CHANGES DOWN THE LINE WITH MORE PQTL DATASETS
+# -> CHANGE THE DASHBOARD FUNCT TO ADD MORE PQTL DATASETS
+# biomarker meta analysis: https://pmc.ncbi.nlm.nih.gov/articles/instance/12136742/pdf/nihpp-rs6597595v1.pdf
 
 def create_streamlit_ammenities(db_name: str, port_number: str):
-    cmd = f"""
-set -euo pipefail 
-mkdir -p .streamlit
-cat > .streamlit/secrets.toml <<EOF
-[connections.postgresql]
+    streamlit_dir = Path(".streamlit")
+    streamlit_dir.mkdir(parents=True, exist_ok=True)
+
+    secrets = f"""[connections.postgresql]
 dialect = "postgresql"
 host = "localhost"
 port = "{port_number}"
 database = "{db_name}"
 username = ""
 password = ""
-EOF
-    """
+"""
 
-    # run in terminal to create streamlit ammenities 
-    subprocess.run(cmd, shell=True, check=True, executable="/bin/bash")
+    # create local streamlit ammenities
+    (streamlit_dir / "secrets.toml").write_text(secrets, encoding="utf-8")
 
 
 def retention(current: int, previous: int):
     return 0.0 if previous == 0 else 100 * current / previous
 
 
-def dashboard(db_name: str, phenotype: str):
+def available_cols(df: pd.DataFrame, cols: list[str]):
+    return [col for col in cols if col in df.columns]
+
+
+def load_required_tsv(file: Path, label: str):
+    if not file.exists():
+        st.error(f"{label} result file not found: {file}")
+        st.stop()
+
+    try:
+        df = pd.read_csv(file, sep="\t", low_memory=False)
+    except (OSError, pd.errors.ParserError, UnicodeDecodeError) as error:
+        st.error(f"{label} result file could not be read: {file}")
+        st.exception(error)
+        st.stop()
+
+    if df.empty:
+        st.error(f"{label} result file is empty: {file}")
+        st.stop()
+
+    return df
+
+
+def load_optional_tsv(file: Path, label: str):
+    if not file.exists():
+        st.warning(f"{label} result file not found: {file}")
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(file, sep="\t", low_memory=False)
+    except (OSError, pd.errors.ParserError, UnicodeDecodeError) as error:
+        st.warning(f"{label} result file could not be read: {file}")
+        st.exception(error)
+        return pd.DataFrame()
+
+    if df.empty:
+        st.warning(f"{label} result file is empty: {file}")
+        return pd.DataFrame()
+
+    return df
+
+
+def find_result_file(project_dir: Path, candidate_files: list[Path], candidate_names: list[str]):
+    for file in candidate_files:
+        if file.exists():
+            return file
+
+    matches = []
+
+    for candidate_name in candidate_names:
+        matches.extend(list((project_dir / "results").rglob(candidate_name)))
+
+    matches = sorted(set(matches))
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+def filter_protein(df: pd.DataFrame, protein: str):
+    if df.empty or not protein or "protein" not in df.columns:
+        return df
+
+    return df[
+        df["protein"]
+        .astype(str)
+        .str.contains(protein, case=False, na=False, regex=False)
+    ].copy()
+
+
+def safe_nunique(df: pd.DataFrame, col: str):
+    if df.empty or col not in df.columns:
+        return 0
+
+    return df[col].nunique()
+
+
+def safe_median(df: pd.DataFrame, col: str, scientific: bool = False):
+    if df.empty or col not in df.columns:
+        return "NA"
+
+    values = pd.to_numeric(df[col], errors="coerce").dropna()
+
+    if values.empty:
+        return "NA"
+
+    if scientific:
+        return f"{values.median():.3e}"
+
+    return f"{values.median():.3f}"
+
+
+def standardise_columns(df: pd.DataFrame):
+    df = df.copy()
+
+    df.columns = (
+        pd.Index(df.columns)
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"[^a-z0-9]+", "_", regex=True)
+        .str.strip("_")
+    )
+
+    if df.columns.duplicated().any():
+        duplicated_cols = df.columns[df.columns.duplicated()].unique().tolist()
+        st.error(f"Duplicated columns after standardisation: {duplicated_cols}")
+        st.stop()
+
+    return df
+
+
+
+def prepare_phewas(df: pd.DataFrame):
+    if df.empty:
+        return df
+
+    df = standardise_columns(df)
+
+    df = df.rename(columns={
+        "protein_id": "protein",
+    })
+
+    # A1/A2 already come from the original outcome GWAS
+    # do not overwrite them with PheWAS REF/ALT
+    for col in ["a1", "a2", "ukb_ref", "ukb_alt", "finngen_ref", "finngen_alt"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.upper()
+
+    for col in [
+        "n_instruments",
+        "n_instruments_original",
+        "n_instruments_available",
+        "instrument_completeness",
+        "beta_mr",
+        "se_mr",
+        "p_mr",
+        "p_fdr",
+        "fdr_q",
+        "p_bonferroni"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "fdr_significant" in df.columns:
+        df["fdr_significant"] = (
+            df["fdr_significant"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+    elif "fdr_q" in df.columns:
+        df["fdr_significant"] = df["fdr_q"].fillna(np.inf) <= 0.05
+    elif "p_fdr" in df.columns:
+        df["fdr_significant"] = df["p_fdr"].fillna(np.inf) <= 0.05
+
+    if "bonferroni_significant" in df.columns:
+        df["bonferroni_significant"] = (
+            df["bonferroni_significant"]
+            .astype(str)
+            .str.lower()
+            .isin(["true", "1", "yes"])
+        )
+    elif "p_bonferroni" in df.columns:
+        df["bonferroni_significant"] = df["p_bonferroni"].fillna(np.inf) <= 0.05
+
+    return df
+
+
+def subset_phewas_outcome(df: pd.DataFrame, outcome: str):
+    if df.empty:
+        return df
+
+    if "outcome_trait" in df.columns:
+        return df[df["outcome_trait"] == outcome].copy()
+
+    if "pheno_id" in df.columns:
+        return df[df["pheno_id"] == outcome].copy()
+
+    return df.copy()
+
+
+def render_phewas_section(
+    phewas_outcome: pd.DataFrame,
+    mr_coloc_pass: pd.DataFrame,
+    source_name: str,
+    source_description: str,
+    n_endpoints: int,
+    pqtl_dataset: str,
+    outcome: str,
+    key_prefix: str
+):
+    st.subheader(f"{source_name} PheWAS safety and repurposing profile")
+
+    if phewas_outcome.empty:
+        st.info(f"No local {source_name} PheWAS safety results are available for this outcome.")
+        return
+
+    if "protein" not in phewas_outcome.columns:
+        st.error(f"The {source_name} PheWAS result file does not contain a protein column.")
+        return
+
+    phewas_targets = sorted(phewas_outcome["protein"].dropna().astype(str).unique())
+
+    if len(phewas_targets) == 0:
+        st.info(f"No proteins were found in the {source_name} PheWAS safety table.")
+        return
+
+    default_phewas_target = 0
+    prioritised_target_names = mr_coloc_pass["protein"].dropna().astype(str).unique().tolist()
+
+    for target in prioritised_target_names:
+        if target in phewas_targets:
+            default_phewas_target = phewas_targets.index(target)
+            break
+
+    with st.container(border=True):
+        target_col, target_info_col = st.columns([2, 1])
+
+        with target_col:
+            selected_phewas_target = st.selectbox(
+                "Target",
+                phewas_targets,
+                index=default_phewas_target,
+                key=f"{key_prefix}_selected_phewas_target"
+            )
+
+        with target_info_col:
+            st.metric("Targets with PheWAS results", len(phewas_targets))
+
+    target_phewas = phewas_outcome[
+        phewas_outcome["protein"].astype(str) == selected_phewas_target
+    ].copy()
+
+    p_col = "p_mr" if "p_mr" in target_phewas.columns else None
+    beta_col = "beta_mr" if "beta_mr" in target_phewas.columns else None
+    bonferroni_col = "p_bonferroni" if "p_bonferroni" in target_phewas.columns else None
+
+    if p_col is None or beta_col is None:
+        st.error(
+            f"The {source_name} PheWAS result file needs the MR effect column "
+            "(beta_mr) and the MR p-value column (p_mr)."
+        )
+        return
+
+    target_phewas = target_phewas[
+        target_phewas[p_col].notna() &
+        target_phewas[beta_col].notna() &
+        (target_phewas[p_col] > 0)
+    ].copy()
+
+    if target_phewas.empty:
+        st.info(f"No valid {source_name} PheWAS associations were found for {selected_phewas_target}.")
+        return
+
+    target_phewas["minus_log10_p"] = -np.log10(target_phewas[p_col])
+
+    if bonferroni_col is not None:
+        target_phewas["bonferroni_significant"] = target_phewas[bonferroni_col].fillna(np.inf) <= 0.05
+    elif "bonferroni_significant" not in target_phewas.columns:
+        target_phewas["bonferroni_significant"] = False
+
+    phenotype_col = "phenostring" if "phenostring" in target_phewas.columns else "phenocode"
+
+    if phenotype_col not in target_phewas.columns:
+        st.error(f"The {source_name} PheWAS result file does not contain a phenotype column.")
+        return
+
+    category_col = "category" if "category" in target_phewas.columns else None
+    n_phenotypes = target_phewas[phenotype_col].nunique()
+    n_nominal = int((target_phewas[p_col] < 0.05).sum())
+    n_bonferroni = int(target_phewas["bonferroni_significant"].sum())
+
+    with st.container(border=True):
+        metric1, metric2, metric3 = st.columns(3)
+        metric1.metric(f"{source_name} phenotypes tested", int(n_phenotypes))
+        metric2.metric("Nominal associations", n_nominal)
+        metric3.metric("Bonferroni-significant associations", n_bonferroni)
+
+    st.caption(
+        f"PheWAS MR estimates show the effect of genetically predicted protein abundance "
+        f"on each {source_description}. Wald ratio is used for targets with one available "
+        "cis-MR instrument and IVW is used for targets with > 1."
+    )
+
+    plot_kwargs = {
+        "data_frame": target_phewas,
+        "x": beta_col,
+        "y": "minus_log10_p",
+        "hover_name": phenotype_col,
+        "symbol": "bonferroni_significant",
+        "hover_data": {
+            beta_col: ":.4f",
+            p_col: ":.3e",
+            "minus_log10_p": False,
+            "bonferroni_significant": True
+        },
+        "labels": {
+            beta_col: "PheWAS MR beta",
+            "minus_log10_p": "-log10(PheWAS p-value)",
+            "bonferroni_significant": "Bonferroni significant"
+        },
+        "title": f"{source_name} PheWAS profile: {selected_phewas_target}",
+        "height": 600,
+        "template": "plotly_white"
+    }
+
+    if "phenocode" in target_phewas.columns:
+        plot_kwargs["hover_data"]["phenocode"] = True
+
+    if category_col is not None:
+        plot_kwargs["color"] = category_col
+        plot_kwargs["labels"][category_col] = f"{source_name} category"
+
+    st.divider()
+    st.subheader("Phenome-wide association landscape")
+
+    phewas_fig = px.scatter(**plot_kwargs)
+    phewas_fig.add_hline(y=-np.log10(0.05 / n_endpoints), line_dash="dash", line_color="grey")
+    phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
+    st.plotly_chart(phewas_fig, width="stretch")
+
+    st.subheader("Bonferroni-significant PheWAS associations")
+    top_phewas = target_phewas[target_phewas["bonferroni_significant"]].copy()
+    top_phewas = top_phewas.sort_values(
+        [beta_col, bonferroni_col if bonferroni_col is not None else p_col],
+        ascending=[True, True]
+    )
+
+    if top_phewas.empty:
+        st.info(
+            f"No {source_name} phenotype associations survive Bonferroni correction across "
+            f"{n_endpoints:,} endpoints for {selected_phewas_target}."
+        )
+    else:
+        top_plot_kwargs = {
+            "data_frame": top_phewas,
+            "x": beta_col,
+            "y": phenotype_col,
+            "hover_data": {
+                beta_col: ":.4f",
+                p_col: ":.3e",
+                "minus_log10_p": ":.3f"
+            },
+            "labels": {
+                beta_col: "PheWAS MR beta",
+                phenotype_col: ""
+            },
+            "title": "Bonferroni-significant PheWAS associations",
+            "height": max(450, 45 * len(top_phewas)),
+            "template": "plotly_white"
+        }
+
+        if "phenocode" in top_phewas.columns:
+            top_plot_kwargs["hover_data"]["phenocode"] = True
+
+        if category_col is not None:
+            top_plot_kwargs["color"] = category_col
+            top_plot_kwargs["labels"][category_col] = f"{source_name} category"
+
+        top_phewas_fig = px.scatter(**top_plot_kwargs)
+        top_phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
+        st.plotly_chart(top_phewas_fig, width="stretch")
+
+    phewas_cols = [
+        "protein",
+        "method",
+        "n_instruments_original",
+        "n_instruments_available",
+        "n_instruments",
+        "instrument_completeness",
+        "missing_instruments",
+        "rsid",
+        "snp",
+        "a1",
+        "a2",
+        "ukb_ref",
+        "ukb_alt",
+        "phenocode",
+        "phenostring",
+        "category",
+        "beta_mr",
+        "se_mr",
+        "p_mr",
+        "p_bonferroni",
+        "bonferroni_significant"
+    ]
+
+    phewas_cols = available_cols(target_phewas, phewas_cols)
+    significant_phewas = target_phewas[target_phewas["bonferroni_significant"]].copy()
+    significant_phewas = significant_phewas.sort_values(bonferroni_col if bonferroni_col is not None else p_col, ascending=True)
+
+    if significant_phewas.empty:
+        st.success(
+            f"No {source_name} phenotype associations survive Bonferroni correction across "
+            f"{n_endpoints:,} endpoints for this target."
+        )
+    else:
+        st.dataframe(
+            significant_phewas[phewas_cols],
+            width="stretch",
+            hide_index=True
+        )
+
+    with st.expander(f"View all {source_name} PheWAS associations"):
+        remaining_cols = [col for col in target_phewas.columns if col not in phewas_cols]
+        st.dataframe(
+            target_phewas[phewas_cols + remaining_cols].sort_values(p_col, ascending=True),
+            width="stretch",
+            hide_index=True
+        )
+
+    st.download_button(
+        label=f"Download {selected_phewas_target} {source_name} PheWAS results",
+        data=target_phewas.to_csv(index=False, sep="\t"),
+        file_name=f"{selected_phewas_target}_{outcome}_{source_name.replace(' ', '_')}_PheWAS.tsv",
+        mime="text/tab-separated-values",
+        key=f"{key_prefix}_download_phewas_{pqtl_dataset}_{outcome}_{selected_phewas_target}",
+        width="stretch"
+    )
+
+
+def dashboard(db_name: str, port_number: str, phenotype: str, pqtl_dataset: str):
     mr_table = "cis_mr_results"
     coloc_table = "coloc_results"
-    smr_table = "single_cell_smr_results"
-    eqtl_coloc_table = "eqtl_coloc_results"
-    moloc_table = "moloc_results"
-    overview_table = "multi_omics_overview"
-    snp_table = "multi_omics_snp_evidence"
-    phewas_table = "phewas_safety"
+    finngen_phewas_table = "finngen_phewas_safety"
+    ukb_phewas_table = "ukb_phewas_safety"
 
     # main aesthetics
-    st.set_page_config(page_title=f"{db_name}", layout="wide")
-    conn = st.connection("postgresql", type="sql")
+    # native Streamlit only - no HTML or CSS
+    st.set_page_config(
+        page_title=f"{db_name}",
+        page_icon="",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
 
-    # corresponding multi-omics result files
+    try:
+        conn = st.connection(
+            "postgresql",
+            type="sql",
+            url=f"postgresql://localhost:{port_number}/{db_name}"
+        )
+    except Exception as error:
+        st.error("The PostgreSQL connection could not be initialised.")
+        st.exception(error)
+        st.stop()
+
+    # pQTL dataset selection schema 
+    # CLI pQTL dataset is used as the default dashboard selection
+    dataset_names = {
+        "ukb_ppp": "UKB-PPP",
+        "decode": "deCODE",
+        "wu_csf": "WU-CSF",
+        "wingo_brain": "Wingo_Brain"
+    }
+
+    dataset_ns = {
+        "ukb_ppp": 54219,
+        "decode": 35559,
+        "wu_csf": 3506,
+        "wingo_brain": 1013
+    }
+
     project_dir = Path(__file__).resolve().parent.parent
-    smr_file = project_dir / f"results/SMR/SingleBrain/{phenotype}/ukb_ppp_{phenotype}_promising_targets_SMR.tsv"
-    eqtl_coloc_file = project_dir / f"results/eQTL_coloc/ukb_ppp/SingleBrain/{phenotype}/ukb_ppp_{phenotype}_SingleBrain_all_eqtl_coloc.tsv"
-    moloc_file = project_dir / f"results/QTL_moloc/ukb_ppp/SingleBrain/{phenotype}/ukb_ppp_{phenotype}_SingleBrain_moloc_summary.tsv"
-    overview_file = project_dir / f"results/SMR/SingleBrain/{phenotype}/ukb_ppp_{phenotype}_multi_omics_overview.tsv"
-    snp_file = project_dir / f"results/SMR/SingleBrain/{phenotype}/ukb_ppp_{phenotype}_multi_omics_snp_evidence.tsv"
-    phewas_file = project_dir / f"results/PheWAS/ukb_ppp/{phenotype}/ukb_ppp_{phenotype}_PheWAS.tsv"
-    # "{pqtl_dataset}_{pheno_id}_PheWAS.tsv"
 
-    # create new dashboard tables if they do not exist yet
-    tables = inspect(conn.engine).get_table_names()
+    # check which datasets have the required dashboard files
+    dataset_result_files = {}
+    available_datasets = []
 
-    if smr_table not in tables:
-        if not smr_file.exists():
-            st.error(f"SMR result file not found: {smr_file}")
-            st.stop()
+    for dataset_id in dataset_names:
+        mr_file = find_result_file(
+            project_dir,
+            [
+                project_dir / f"results/cis-MR/{dataset_id}_{phenotype}_all_MR.tsv",
+                project_dir / f"results/cis_MR/{dataset_id}_{phenotype}_all_MR.tsv",
+                project_dir / f"results/cis_MR/{dataset_id}/{phenotype}/{dataset_id}_{phenotype}_all_MR.tsv",
+                project_dir / f"results/MR/{dataset_id}/{phenotype}/{dataset_id}_{phenotype}_all_MR.tsv",
+                project_dir / f"results/MR/{dataset_id}_{phenotype}_all_MR.tsv"
+            ],
+            [
+                f"{dataset_id}_{phenotype}_all_MR.tsv",
+                f"{dataset_id}_{phenotype}_MR.tsv"
+            ]
+        )
 
-        smr = pd.read_csv(smr_file, sep="\t")
-        smr.to_sql(smr_table, conn.engine, if_exists="replace", index=False)
-        st.write(f"[TRACKING] Loaded {len(smr)} rows into {smr_table}")
+        coloc_file = find_result_file(
+            project_dir,
+            [
+                project_dir / f"results/coloc/{dataset_id}/{dataset_id}_{phenotype}_all_coloc.tsv",
+                project_dir / f"results/coloc/{dataset_id}/{phenotype}/{dataset_id}_{phenotype}_all_coloc.tsv",
+                project_dir / f"results/COLOC/{dataset_id}/{phenotype}/{dataset_id}_{phenotype}_all_coloc.tsv",
+                project_dir / f"results/COLOC/{dataset_id}_{phenotype}_all_coloc.tsv",
+                project_dir / f"results/coloc/{dataset_id}_{phenotype}_all_coloc.tsv"
+            ],
+            [
+                f"{dataset_id}_{phenotype}_all_coloc.tsv",
+                f"{dataset_id}_{phenotype}_coloc.tsv",
+                f"{dataset_id}_{phenotype}_COLOC.tsv"
+            ]
+        )
 
-    if eqtl_coloc_table not in tables:
-        if not eqtl_coloc_file.exists():
-            st.error(f"eQTL COLOC result file not found: {eqtl_coloc_file}")
-            st.stop()
+        finngen_phewas_file = project_dir / "results" / "PheWAS" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_PheWAS.tsv"
+        ukb_phewas_file = project_dir / "results" / "PheWAS_UKBB" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_PheWAS.tsv"
+        target_info_file = project_dir / "results" / "target_stats" / dataset_id / phenotype / f"{dataset_id}_{phenotype}_top_cis_hits.tsv"
+        smr_file = project_dir / "results" / "SMR" / f"{dataset_id}_{phenotype}_final_multi_omics_targets.tsv"
 
-        eqtl_coloc = pd.read_csv(eqtl_coloc_file, sep="\t")
-        eqtl_coloc.to_sql(eqtl_coloc_table, conn.engine, if_exists="replace", index=False)
-        st.write(f"[TRACKING] Loaded {len(eqtl_coloc)} rows into {eqtl_coloc_table}")
+        required_files = [
+            mr_file,
+            coloc_file
+        ]
 
-    if moloc_table not in tables:
-        if not moloc_file.exists():
-            st.error(f"MOLOC result file not found: {moloc_file}")
-            st.stop()
+        if all(file is not None and file.exists() for file in required_files):
+            available_datasets.append(dataset_id)
+            dataset_result_files[dataset_id] = {
+                "mr": mr_file,
+                "coloc": coloc_file,
+                "finngen_phewas": finngen_phewas_file,
+                "ukb_phewas": ukb_phewas_file,
+                "target_info": target_info_file,
+                "smr": smr_file
+            }
 
-        moloc = pd.read_csv(moloc_file, sep="\t")
-        moloc.to_sql(moloc_table, conn.engine, if_exists="replace", index=False)
-        st.write(f"[TRACKING] Loaded {len(moloc)} rows into {moloc_table}")
-
-    if not overview_file.exists():
-        st.error(f"Overview result file not found: {overview_file}")
+    if len(available_datasets) == 0:
+        st.error(f"No dataset has a complete set of cis-MR and COLOC dashboard files for {phenotype}.")
         st.stop()
 
-    overview = pd.read_csv(overview_file, sep="\t")
-    overview.to_sql(overview_table, conn.engine, if_exists="replace", index=False)
-    st.write(f"[TRACKING] Loaded {len(overview)} rows into {overview_table}")
+    # use the CLI dataset as default
+    # otherwise use the first complete dataset which was found
+    if pqtl_dataset not in available_datasets:
+        pqtl_dataset = available_datasets[0]
 
-    if not snp_file.exists():
-        st.error(f"SNP evidence file not found: {snp_file}")
-        st.stop()
+    available_dataset_names = [dataset_names[dataset_id] for dataset_id in available_datasets]
+    default_dataset_name = dataset_names[pqtl_dataset]
 
-    snp = pd.read_csv(snp_file, sep="\t")
-    snp.to_sql(snp_table, conn.engine, if_exists="replace", index=False)
-    st.write(f"[TRACKING] Loaded {len(snp)} rows into {snp_table}")
+    st.title(f"{db_name}")
+    st.caption("Genetically supported drug target discovery and clinical safety dashboard")
 
-    # phewas gist
-    if not phewas_file.exists():
-        st.warning(f"PheWAS safety result file not found: {phewas_file}")
-        phewas_available = False
-    else:
-        phewas = pd.read_csv(phewas_file, sep="\t")
-        if phewas.empty:
-            st.warning(f"PheWAS safety result file is empty: {phewas_file}")
-            phewas_available = False
-        else:
-            phewas.to_sql(
-                phewas_table,
-                conn.engine,
-                if_exists="replace",
-                index=False
+    with st.container(border=True):
+        dataset_col, dataset_info_col = st.columns([2, 1])
+
+        with dataset_col:
+            selected_dataset_name = st.segmented_control(
+                "pQTL dataset",
+                available_dataset_names,
+                default=default_dataset_name,
+                selection_mode="single",
+                key="pqtl_dataset_selector"
             )
 
-            st.write(f"[TRACKING] Loaded {len(phewas)} rows into {phewas_table}")
-            phewas_available = True
+        dataset_ids = {dataset_name: dataset_id for dataset_id, dataset_name in dataset_names.items()}
+        if selected_dataset_name is None:
+            selected_dataset_name = default_dataset_name
 
-    # load MR + COLOC + multi-omics results
+        pqtl_dataset = dataset_ids[selected_dataset_name]
+        dataset_name = dataset_names[pqtl_dataset]
+        dataset_n = dataset_ns[pqtl_dataset]
+
+        with dataset_info_col:
+            st.metric("pQTL sample size", f"{dataset_n:,}")
+
+    st.divider()
+
+    # corresponding selected dataset result files
+    mr_file = dataset_result_files[pqtl_dataset]["mr"]
+    coloc_file = dataset_result_files[pqtl_dataset]["coloc"]
+    finngen_phewas_file = dataset_result_files[pqtl_dataset]["finngen_phewas"]
+    ukb_phewas_file = dataset_result_files[pqtl_dataset]["ukb_phewas"]
+    target_info_file = dataset_result_files[pqtl_dataset]["target_info"]
+    smr_file = dataset_result_files[pqtl_dataset]["smr"]
+
+    # load local result files into PostgreSQL for the dashboard
+    mr = load_required_tsv(mr_file, "cis-MR")
+    coloc = load_required_tsv(coloc_file, "pQTL–GWAS COLOC")
+    finngen_phewas = load_optional_tsv(finngen_phewas_file, "FinnGen PheWAS safety")
+    ukb_phewas = load_optional_tsv(ukb_phewas_file, "UKB PheWAS safety")
+    target_info = load_optional_tsv(target_info_file, "Harmonised target information")
+    smr = load_optional_tsv(smr_file, "SMR (bulk/sc eQTL)")
+
+    # standardise MR + pQTL COLOC columns before loading into PostgreSQL
+    # avoids dataset-specific differences such as Wald_beta vs wald_beta
+    mr = standardise_columns(mr)
+    coloc = standardise_columns(coloc)
+
+    if not target_info.empty:
+        target_info = standardise_columns(target_info)
+
+    if not smr.empty:
+        smr = standardise_columns(smr)
+
+    # make protein column consistent before loading into PostgreSQL
+    if "protein_id" in mr.columns:
+        mr = mr.rename(columns={"protein_id": "protein"})
+
+    if "protein_id" in coloc.columns:
+        coloc = coloc.rename(columns={"protein_id": "protein"})
+
+    if not target_info.empty and "protein_id" in target_info.columns:
+        target_info = target_info.rename(columns={"protein_id": "protein"})
+
+    if not smr.empty and "protein_id" in smr.columns:
+        smr = smr.rename(columns={"protein_id": "protein"})
+
+    # make sure the selected dataset is always recorded
+    if "pqtl_dataset" not in mr.columns:
+        mr["pqtl_dataset"] = pqtl_dataset
+
+    if "pqtl_dataset" not in coloc.columns:
+        coloc["pqtl_dataset"] = pqtl_dataset
+
+
+    # refresh dashboard tables
+    try:
+        mr.to_sql(mr_table, conn.engine, if_exists="replace", index=False)
+        coloc.to_sql(coloc_table, conn.engine, if_exists="replace", index=False)
+    except Exception as error:
+        st.error("The cis-MR or COLOC dashboard table could not be refreshed.")
+        st.exception(error)
+        st.stop()
+
+    finngen_phewas_available = not finngen_phewas.empty
+    ukb_phewas_available = not ukb_phewas.empty
+
+    if finngen_phewas_available:
+        try:
+            finngen_phewas.to_sql(finngen_phewas_table, conn.engine, if_exists="replace", index=False)
+        except Exception as error:
+            st.warning("The FinnGen PheWAS dashboard table could not be refreshed.")
+            st.exception(error)
+            finngen_phewas_available = False
+
+    if ukb_phewas_available:
+        try:
+            ukb_phewas.to_sql(ukb_phewas_table, conn.engine, if_exists="replace", index=False)
+        except Exception as error:
+            st.warning("The UKB PheWAS dashboard table could not be refreshed.")
+            st.exception(error)
+            ukb_phewas_available = False
+
+    with st.sidebar.expander("Tracking", expanded=False):
+        st.write(f"Loaded {len(mr)} rows into {mr_table}")
+        st.write(f"Loaded {len(coloc)} rows into {coloc_table}")
+
+        if finngen_phewas_available:
+            st.write(f"Loaded {len(finngen_phewas)} rows into {finngen_phewas_table}")
+
+        if ukb_phewas_available:
+            st.write(f"Loaded {len(ukb_phewas)} rows into {ukb_phewas_table}")
+
+        if not target_info.empty:
+            st.write(f"Loaded {len(target_info)} harmonised top cis-hit rows")
+
+        if not smr.empty:
+            st.write(f"Loaded {len(smr)} SMR (bulk/sc eQTL) rows")
+
+    # load MR + COLOC results
     mr = conn.query(f"SELECT * FROM {mr_table};", ttl=0)
     coloc = conn.query(f"SELECT * FROM {coloc_table};", ttl=0)
-    smr = conn.query(f"SELECT * FROM {smr_table};", ttl=0)
-    eqtl_coloc = conn.query(f"SELECT * FROM {eqtl_coloc_table};", ttl=0)
-    moloc = conn.query(f"SELECT * FROM {moloc_table};", ttl=0)
-    overview = conn.query(f"SELECT * FROM {overview_table};", ttl=0)
-    snp = conn.query(f"SELECT * FROM {snp_table};", ttl=0)
-    snp = snp[snp["phenotype"] == phenotype].copy()
-    
-    # check whether phewas is avaulable cuz snp_targets.shape[0] might == 0
-    if phewas_available:
-        phewas = conn.query(f"SELECT * FROM {phewas_table};", ttl=0)
+
+    if finngen_phewas_available:
+        finngen_phewas = prepare_phewas(conn.query(f"SELECT * FROM {finngen_phewas_table};", ttl=0))
     else:
-        phewas = pd.DataFrame()
+        finngen_phewas = pd.DataFrame()
 
-    # standardise cols of QTL stuff
-    # make SMR columns easier to use
-    smr = smr.rename(columns={
-        "Gene": "gene",
-        "topSNP": "top_snp",
-        "b_SMR": "b_smr",
-        "se_SMR": "se_smr",
-        "p_SMR": "p_smr",
-        "p_HEIDI": "p_heidi",
-        "q_SMR": "q_smr"
-    })
-
-    # make eQTL COLOC columns consistent
-    eqtl_coloc = eqtl_coloc.rename(columns={
-        "protein_id": "protein",
-        "outcome_trait": "phenotype",
-        "PP.H0.abf": "eqtl_pp_h0_abf",
-        "PP.H1.abf": "eqtl_pp_h1_abf",
-        "PP.H2.abf": "eqtl_pp_h2_abf",
-        "PP.H3.abf": "eqtl_pp_h3_abf",
-        "PP.H4.abf": "eqtl_pp_h4_abf"
-    })
-
-    # make MOLOC columns consistent
-    moloc = moloc.rename(columns={"model": "moloc_model", "PPA": "moloc_ppa"})
-
-    # make PheWAS columns consistent
-    if not phewas.empty:
-        phewas = phewas.rename(columns={
-            "PROTEIN": "protein",
-            "protein_id": "protein",
-            "PHENO_ID": "pheno_id",
-            "OUTCOME_TRAIT": "outcome_trait",
-            "PHENOCODE": "phenocode",
-            "PHENOSTRING": "phenostring",
-            "CATEGORY": "category",
-            "SNP": "SNP",
-            "RSID": "SNP",
-            "BETA": "beta",
-            "SEBETA": "sebeta",
-            "PVAL": "pval",
-            "WALD_RATIO": "wald_ratio",
-            "WALD_SE": "wald_se",
-            "P_WALD_RATIO": "p_wald_ratio",
-            "WALD_PVAL": "p_wald_ratio",
-            "Q_FDR_WALD_RATIO": "q_fdr_wald_ratio",
-            "WALD_FDR_Q": "q_fdr_wald_ratio",
-            "FDR_SIGNIFICANT": "fdr_significant"
-        })
-
-        for col in [
-            "beta",
-            "sebeta",
-            "pval",
-            "wald_ratio",
-            "wald_se",
-            "p_wald_ratio",
-            "q_fdr_wald_ratio"
-        ]:
-            if col in phewas.columns:
-                phewas[col] = pd.to_numeric(phewas[col], errors="coerce")
-
-        if "fdr_significant" in phewas.columns:
-            phewas["fdr_significant"] = (
-                phewas["fdr_significant"]
-                .astype(str)
-                .str.lower()
-                .isin(["true", "1", "yes"])
-            )
-        elif "q_fdr_wald_ratio" in phewas.columns:
-            phewas["fdr_significant"] = phewas["q_fdr_wald_ratio"].fillna(np.inf) <= 0.05
+    if ukb_phewas_available:
+        ukb_phewas = prepare_phewas(conn.query(f"SELECT * FROM {ukb_phewas_table};", ttl=0))
+    else:
+        ukb_phewas = pd.DataFrame()
 
     # MR ammenities
+    # standardise numeric MR columns
+    mr_numeric_cols = [
+        "n_instruments",
+        "ivw_beta",
+        "ivw_se",
+        "ivw_pval",
+        "ivw_fdr_q",
+        "wald_beta",
+        "wald_se",
+        "wald_pval",
+        "wald_fdr_q",
+        "q_pval",
+        "egger_intercept_pval"
+    ]
+
+    for col in mr_numeric_cols:
+        if col not in mr.columns:
+            mr[col] = np.nan
+
+        mr[col] = pd.to_numeric(mr[col], errors="coerce")
+
+    coloc_numeric_cols = [
+        "pp_h0_abf",
+        "pp_h1_abf",
+        "pp_h2_abf",
+        "pp_h3_abf",
+        "pp_h4_abf"
+    ]
+
+    for col in coloc_numeric_cols:
+        if col in coloc.columns:
+            coloc[col] = pd.to_numeric(coloc[col], errors="coerce")
+
+    if "protein_id" in mr.columns:
+        mr = mr.rename(columns={"protein_id": "protein"})
+
+    if "protein_id" in coloc.columns:
+        coloc = coloc.rename(columns={"protein_id": "protein"})
+
+    if not target_info.empty:
+        target_numeric_cols = [
+            "frq",
+            "gwas_beta",
+            "gwas_se",
+            "gwas_p",
+            "pqtl_beta",
+            "pqtl_se",
+            "pqtl_p"
+        ]
+
+        for col in target_numeric_cols:
+            if col in target_info.columns:
+                target_info[col] = pd.to_numeric(target_info[col], errors="coerce")
+
+        for col in ["a1", "a2"]:
+            if col in target_info.columns:
+                target_info[col] = target_info[col].astype(str).str.upper()
+
+        if "protein" in target_info.columns:
+            target_info = target_info.drop_duplicates(subset=["protein"])
+
+    required_mr_cols = ["protein", "outcome_trait", "n_instruments"]
+    missing_mr_cols = [col for col in required_mr_cols if col not in mr.columns]
+
+    if len(missing_mr_cols) > 0:
+        st.error(
+            f"cis-MR result file is missing required columns: {missing_mr_cols}. "
+            f"File: {mr_file}"
+        )
+        st.stop()
+
+    required_coloc_cols = ["protein", "outcome_trait"]
+    missing_coloc_cols = [col for col in required_coloc_cols if col not in coloc.columns]
+
+    if len(missing_coloc_cols) > 0:
+        st.error(
+            f"COLOC result file is missing required columns: {missing_coloc_cols}. "
+            f"File: {coloc_file}"
+        )
+        st.stop()
+
     # if 1 instrument -> use Wald
     # otherwise -> use IVW
     mr["mr_method"] = np.where(mr["n_instruments"] == 1, "Wald ratio", "IVW")
@@ -222,60 +797,84 @@ def dashboard(db_name: str, phenotype: str):
     mr["mr_pval"] = np.where(mr["n_instruments"] == 1, mr["wald_pval"], mr["ivw_pval"])
     mr["mr_fdr_q"] = np.where(mr["n_instruments"] == 1, mr["wald_fdr_q"], mr["ivw_fdr_q"])
 
-    # make protein column consistent between MR and COLOC
-    if "protein_id" in coloc.columns:
-        coloc = coloc.rename(columns={"protein_id": "protein"})
+    # standardise selected pQTL dataset
+    selected_pqtl_dataset = (
+        str(pqtl_dataset)
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    # subset database tables to the selected pQTL dataset where possible
+    for dataset_col in ["pqtl_dataset", "dataset"]:
+        if dataset_col in mr.columns:
+            mr_dataset_values = (
+                mr[dataset_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .str.replace("-", "_", regex=False)
+                .str.replace(" ", "_", regex=False)
+            )
+
+            mr = mr[mr_dataset_values == selected_pqtl_dataset].copy()
+            break
+
+    for dataset_col in ["pqtl_dataset", "dataset"]:
+        if dataset_col in coloc.columns:
+            coloc_dataset_values = (
+                coloc[dataset_col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .str.replace("-", "_", regex=False)
+                .str.replace(" ", "_", regex=False)
+            )
+
+            coloc = coloc[coloc_dataset_values == selected_pqtl_dataset].copy()
+            break
 
     # available outcomes and default CLI phenotype
     outcomes = sorted(mr["outcome_trait"].dropna().unique())
+
+    if len(outcomes) == 0:
+        st.error(f"No cis-MR results were found in {mr_file} for {dataset_name}.")
+        st.stop()
+
     default_outcome = outcomes.index(phenotype) if phenotype in outcomes else 0
 
     # sidebar filters
-    outcome = st.sidebar.selectbox("Outcome", outcomes, index=default_outcome)
-    fdr = st.sidebar.slider("MR FDR threshold", 0.0, 1.0, 0.05, 0.01)
-    q_pval = st.sidebar.slider("Minimum Cochran Q p-value", 0.0, 1.0, 0.05, 0.01)
-    # egger_pval = st.sidebar.slider("Minimum Egger intercept p-value", 0.0, 1.0, 0.05, 0.01)
-    pp4 = st.sidebar.slider("pQTL–GWAS COLOC PP.H4 threshold", 0.0, 1.0, 0.70, 0.01)
-    smr_q = st.sidebar.slider("Single-cell SMR FDR threshold", 0.0, 1.0, 0.05, 0.01)
-    heidi_p = st.sidebar.slider("Minimum HEIDI p-value", 0.0, 1.0, 0.01, 0.01)
-    eqtl_pp4 = st.sidebar.slider("GWAS–eQTL COLOC PP.H4 threshold", 0.0, 1.0, 0.70, 0.01)
-    moloc_ppa = st.sidebar.slider("Three-trait MOLOC PPA threshold", 0.0, 1.0, 0.70, 0.01)
-    cell_types = sorted(smr["cell_type"].dropna().unique())
-    selected_cell_types = st.sidebar.multiselect("Cell types", cell_types, default=cell_types)
-    protein = st.sidebar.text_input("Protein search")
+    st.sidebar.title("Dashboard controls")
+    st.sidebar.caption(f"{dataset_name} → {phenotype}")
+    st.sidebar.divider()
 
-    st.title(f"{db_name}: UKBB-PPP → {outcome}")
+    with st.sidebar.expander("Analysis selection", expanded=True):
+        outcome = st.selectbox("Outcome", outcomes, index=default_outcome)
+
+    with st.sidebar.expander("Target prioritisation thresholds", expanded=True):
+        fdr = st.slider("MR FDR threshold", 0.0, 1.0, 0.05, 0.01)
+        q_pval = st.slider("Minimum Cochran Q p-value", 0.0, 1.0, 0.05, 0.01)
+        pp4 = st.slider("pQTL–GWAS COLOC PP.H4 threshold", 0.0, 1.0, 0.70, 0.01)
+
+    with st.sidebar.expander("Protein filter", expanded=True):
+        protein = st.text_input(
+            "Protein search",
+            placeholder="e.g. PILRA, APOE or Q9UKJ1"
+        )
+
+    st.header(f"{dataset_name} → {outcome}")
     st.caption(
-        # f"MR FDR ≤ {fdr:.2f} | Q p ≥ {q_pval:.2f} | Egger p ≥ {egger_pval:.2f} | "
-        f"MR FDR ≤ {fdr:.2f} | Q p ≥ {q_pval:.2f} | "
-        f"pQTL–GWAS PP.H4 ≥ {pp4:.2f} | SMR FDR ≤ {smr_q:.2f} | HEIDI p ≥ {heidi_p:.2f} | "
-        f"GWAS–eQTL PP.H4 ≥ {eqtl_pp4:.2f} | MOLOC abc PPA ≥ {moloc_ppa:.2f}"
+        f"N = {dataset_n:,} | MR FDR ≤ {fdr:.2f} | Q p ≥ {q_pval:.2f} | "
+        f"pQTL–GWAS PP.H4 ≥ {pp4:.2f}"
     )
 
     # subset everything to selected outcome
     mr_outcome = mr[mr["outcome_trait"] == outcome].copy()
     coloc_outcome = coloc[coloc["outcome_trait"] == outcome].copy()
-    smr_outcome = smr[smr["phenotype"] == outcome].copy()
-    eqtl_coloc_outcome = eqtl_coloc[eqtl_coloc["phenotype"] == outcome].copy()
-    moloc_outcome = moloc[moloc["phenotype"] == outcome].copy()
-    overview_outcome = overview[overview["phenotype"] == outcome].copy()
-    snp_outcome = snp[snp["phenotype"] == outcome].copy()
 
-    if not phewas.empty:
-        phewas_outcome = phewas.copy()
-
-        if "outcome_trait" in phewas_outcome.columns:
-            phewas_outcome = phewas_outcome[phewas_outcome["outcome_trait"] == outcome].copy()
-        elif "pheno_id" in phewas_outcome.columns:
-            phewas_outcome = phewas_outcome[phewas_outcome["pheno_id"] == outcome].copy()
-    else:
-        phewas_outcome = pd.DataFrame()
-
-    if "cell_type" in overview_outcome.columns:
-        overview_outcome = overview_outcome[overview_outcome["cell_type"].isin(selected_cell_types)]
-
-    if "cell_type" in snp_outcome.columns:
-        snp_outcome = snp_outcome[snp_outcome["cell_type"].isin(selected_cell_types)]
+    finngen_phewas_outcome = subset_phewas_outcome(finngen_phewas, outcome)
+    ukb_phewas_outcome = subset_phewas_outcome(ukb_phewas, outcome)
 
     # STAGE 1
     # cis-MR supported proteins
@@ -293,138 +892,129 @@ def dashboard(db_name: str, phenotype: str):
             (mr_pass["mr_method"] == "Wald ratio")
         ]
 
-    
+
     # STAGE 2
     # pQTL - GWAS COLOC
     coloc_pass = coloc_outcome.copy()
 
-    if "pp_h4_abf" in coloc_pass.columns:
-        coloc_pass = coloc_pass[coloc_pass["pp_h4_abf"].fillna(0) >= pp4]
+    if "pp_h4_abf" not in coloc_pass.columns:
+        st.error(
+            "The COLOC results do not contain the required PP.H4 column. "
+            f"Available columns: {list(coloc_pass.columns)}"
+        )
+        st.stop()
+
+    coloc_pass["pp_h4_abf"] = pd.to_numeric(
+        coloc_pass["pp_h4_abf"],
+        errors="coerce"
+    )
+
+    coloc_pass = coloc_pass[
+        coloc_pass["pp_h4_abf"].fillna(0) >= pp4
+    ].copy()
 
     # proteins which pass both MR + COLOC thresholds
-    mr_coloc_pass = mr_pass.merge(coloc_pass, on="protein", how="inner", suffixes=("_mr", "_pqtl_coloc"))
-    mr_coloc_pass = mr_coloc_pass.drop_duplicates(subset=["protein"])
-
-    # STAGE 3
-    # single-cell SMR + HEIDI for proteins already supported by MR + COLOC
-    smr_pass = smr_outcome[
-        (smr_outcome["q_smr"].fillna(np.inf) <= smr_q) &
-        (smr_outcome["p_heidi"].fillna(-np.inf) >= heidi_p) &
-        (smr_outcome["cell_type"].isin(selected_cell_types))
-    ].copy()
-
-    smr_stage = smr_pass.merge(mr_coloc_pass[["protein"]], on="protein", how="inner")
-    smr_stage = smr_stage.drop_duplicates(subset=["protein", "cell_type"])
-
-    # STAGE 4
-    # GWAS - eQTL COLOC for SMR supported target x cell-type pairs
-    eqtl_coloc_pass = eqtl_coloc_outcome[
-        (eqtl_coloc_outcome["eqtl_pp_h4_abf"].fillna(0) >= eqtl_pp4) &
-        (eqtl_coloc_outcome["cell_type"].isin(selected_cell_types))
-    ].copy()
-
-    smr_eqtl_coloc_stage = smr_stage.merge(
-        eqtl_coloc_pass,
-        on=["protein", "cell_type"],
+    mr_coloc_pass = mr_pass.merge(
+        coloc_pass,
+        on="protein",
         how="inner",
-        suffixes=("_smr", "_eqtl_coloc")
+        suffixes=("_mr", "_pqtl_coloc")
     )
 
-    smr_eqtl_coloc_stage = smr_eqtl_coloc_stage.drop_duplicates(subset=["protein", "cell_type"])
+    # preserve assay-specific protein IDs
+    # only remove fully duplicated merged rows
+    mr_coloc_pass = mr_coloc_pass.drop_duplicates()
 
-    # STAGE 5
-    # pQTL - eQTL - GWAS MOLOC
-    moloc_pass = moloc_outcome[
-        (moloc_outcome["moloc_model"].astype(str).str.lower() == "abc") &
-        (moloc_outcome["moloc_ppa"].fillna(0) >= moloc_ppa) &
-        (moloc_outcome["cell_type"].isin(selected_cell_types))
-    ].copy()
+    # add harmonised top cis-hit information
+    if not target_info.empty and "protein" in target_info.columns:
+        target_cols = [
+            "protein",
+            "snp",
+            "a1",
+            "a2",
+            "frq",
+            "gwas_beta",
+            "gwas_se",
+            "gwas_p",
+            "pqtl_beta",
+            "pqtl_se",
+            "pqtl_p"
+        ]
 
-    final_multi_omics = smr_eqtl_coloc_stage.merge(
-        moloc_pass,
-        on=["protein", "cell_type"],
-        how="inner",
-        suffixes=("", "_moloc")
-    )
+        target_cols = available_cols(target_info, target_cols)
 
-    final_multi_omics = final_multi_omics.drop_duplicates(subset=["protein", "cell_type"])
+        mr_coloc_pass = mr_coloc_pass.merge(
+            target_info[target_cols],
+            on="protein",
+            how="left"
+        )
+
+
+    # SMR (bulk/sc eQTL) hits are not split by outcome_trait like mr/coloc are,
+    # so they're carried through as their own table rather than an "_outcome" subset
+    smr_display = smr.copy()
 
     # protein search
     if protein:
-        mr_outcome = mr_outcome[mr_outcome["protein"].str.contains(protein, case=False, na=False)]
-        mr_pass = mr_pass[mr_pass["protein"].str.contains(protein, case=False, na=False)]
-        coloc_pass = coloc_pass[coloc_pass["protein"].str.contains(protein, case=False, na=False)]
-        mr_coloc_pass = mr_coloc_pass[mr_coloc_pass["protein"].str.contains(protein, case=False, na=False)]
-        smr_stage = smr_stage[smr_stage["protein"].str.contains(protein, case=False, na=False)]
-        smr_eqtl_coloc_stage = smr_eqtl_coloc_stage[smr_eqtl_coloc_stage["protein"].str.contains(protein, case=False, na=False)]
-        final_multi_omics = final_multi_omics[final_multi_omics["protein"].str.contains(protein, case=False, na=False)]
-        overview_outcome = overview_outcome[overview_outcome["protein"].str.contains(protein, case=False, na=False)]
-        snp_outcome = snp_outcome[snp_outcome["protein"].str.contains(protein, case=False, na=False)]
-
-        if not phewas_outcome.empty and "protein" in phewas_outcome.columns:
-            phewas_outcome = phewas_outcome[phewas_outcome["protein"].str.contains(protein, case=False, na=False)]
+        mr_outcome = filter_protein(mr_outcome, protein)
+        mr_pass = filter_protein(mr_pass, protein)
+        coloc_pass = filter_protein(coloc_pass, protein)
+        mr_coloc_pass = filter_protein(mr_coloc_pass, protein)
+        finngen_phewas_outcome = filter_protein(finngen_phewas_outcome, protein)
+        ukb_phewas_outcome = filter_protein(ukb_phewas_outcome, protein)
+        smr_display = filter_protein(smr_display, protein)
 
     # round coloc posterior probs
-    for col in ["pp_h0_abf", "pp_h1_abf", "pp_h2_abf", "pp_h3_abf", "pp_h4_abf"]:
+    for col in coloc_numeric_cols:
         if col in coloc_pass.columns:
             coloc_pass[col] = coloc_pass[col].round(3)
 
         if col in mr_coloc_pass.columns:
             mr_coloc_pass[col] = mr_coloc_pass[col].round(3)
 
-    for col in ["eqtl_pp_h0_abf", "eqtl_pp_h1_abf", "eqtl_pp_h2_abf", "eqtl_pp_h3_abf", "eqtl_pp_h4_abf"]:
-        if col in eqtl_coloc_pass.columns:
-            eqtl_coloc_pass[col] = eqtl_coloc_pass[col].round(3)
-
-        if col in smr_eqtl_coloc_stage.columns:
-            smr_eqtl_coloc_stage[col] = smr_eqtl_coloc_stage[col].round(3)
-
-        if col in final_multi_omics.columns:
-            final_multi_omics[col] = final_multi_omics[col].round(3)
-
-    if "moloc_ppa" in final_multi_omics.columns:
-        final_multi_omics["moloc_ppa"] = final_multi_omics["moloc_ppa"].round(3)
-
     # main staged target counts
-    n_tested = mr_outcome["protein"].nunique()
-    n_mr = mr_pass["protein"].nunique()
-    n_mr_coloc = mr_coloc_pass["protein"].nunique()
-    n_smr = smr_stage["protein"].nunique()
-    n_eqtl_coloc = smr_eqtl_coloc_stage["protein"].nunique()
-    n_final = final_multi_omics["protein"].nunique()
+    n_tested = safe_nunique(mr_outcome, "protein")
+    n_mr = safe_nunique(mr_pass, "protein")
+    n_mr_coloc = safe_nunique(mr_coloc_pass, "protein")
+    n_finngen_phewas = safe_nunique(finngen_phewas_outcome, "protein")
+    n_ukb_phewas = safe_nunique(ukb_phewas_outcome, "protein")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Overview",
-        "cis-MR results",
-        "pQTL COLOC",
-        "Single-cell evidence",
-        "Final targets",
-        "PheWAS safety"
+        "1. cis-MR",
+        "2. pQTL–GWAS COLOC",
+        "3. FinnGen PheWAS",
+        "4. UKB PheWAS",
+        "5. SMR (bulk/sc eQTL)",
+        "6. Final Targets"
     ])
 
     with tab1:
         st.subheader("Target prioritisation")
+        st.caption(
+            "Targets move from cis-MR testing to MR support and then to shared pQTL–GWAS "
+            "causal signal support through pairwise COLOC."
+        )
 
-        metric1, metric2, metric3 = st.columns(3)
-        metric1.metric("Proteins tested by cis-MR", n_tested)
-        metric2.metric("cis-MR supported", n_mr, f"{retention(n_mr, n_tested):.1f}% of tested", delta_color="off")
-        metric3.metric("cis-MR + pQTL COLOC", n_mr_coloc, f"{retention(n_mr_coloc, n_mr):.1f}% retained", delta_color="off")
+        with st.container(border=True):
+            metric1, metric2, metric3 = st.columns(3)
+            metric1.metric("Proteins tested by cis-MR", n_tested)
+            metric2.metric("cis-MR supported", n_mr, f"{retention(n_mr, n_tested):.1f}% of tested", delta_color="off")
+            metric3.metric("cis-MR + pQTL COLOC", n_mr_coloc, f"{retention(n_mr_coloc, n_mr):.1f}% retained", delta_color="off")
 
-        metric4, metric5, metric6 = st.columns(3)
-        metric4.metric("+ cell-type SMR/HEIDI", n_smr, f"{retention(n_smr, n_mr_coloc):.1f}% retained", delta_color="off")
-        metric5.metric("+ GWAS–eQTL COLOC", n_eqtl_coloc, f"{retention(n_eqtl_coloc, n_smr):.1f}% retained", delta_color="off")
-        metric6.metric("Final three-trait targets", n_final, f"{retention(n_final, n_eqtl_coloc):.1f}% retained", delta_color="off")
+        st.divider()
 
         funnel_df = pd.DataFrame({
             "stage": [
                 "Proteins tested by cis-MR",
                 "cis-MR supported",
-                "cis-MR + pQTL COLOC",
-                "Cell-type SMR + HEIDI",
-                "GWAS–eQTL COLOC",
-                "Three-trait MOLOC"
+                "cis-MR + pQTL COLOC"
             ],
-            "n_targets": [n_tested, n_mr, n_mr_coloc, n_smr, n_eqtl_coloc, n_final]
+            "n_targets": [
+                n_tested,
+                n_mr,
+                n_mr_coloc
+            ]
         })
 
         funnel_fig = px.bar(
@@ -435,95 +1025,148 @@ def dashboard(db_name: str, phenotype: str):
             text="n_targets",
             title="Progressive target prioritisation",
             labels={"n_targets": "Number of unique proteins", "stage": ""},
-            height=480
+            height=420,
+            template="plotly_white"
         )
 
-        funnel_fig.update_yaxes(categoryorder="array", categoryarray=funnel_df["stage"][::-1])
+        funnel_fig.update_yaxes(
+            categoryorder="array",
+            categoryarray=funnel_df["stage"][::-1]
+        )
         funnel_fig.update_traces(textposition="outside")
-        st.plotly_chart(funnel_fig, use_container_width=True)
+        funnel_fig.update_layout(showlegend=False, margin=dict(l=20, r=40, t=60, b=20))
+        st.plotly_chart(funnel_fig, width="stretch")
 
-        if not final_multi_omics.empty:
-            # we need to add some stuff here 
-            overview_cols = [
+        st.divider()
+        st.subheader("Prioritised targets")
+
+        if not mr_coloc_pass.empty:
+            prioritised_cols = [
                 "protein",
-                "gene_smr",
-                "cell_type",
-                "top_snp_smr",
-                "q_smr",
-                "p_heidi",
-                "eqtl_pp_h4_abf",
-                "moloc_model",
-                "moloc_ppa"
+                "snp",
+                "a1",
+                "a2",
+                "frq",
+                "gwas_beta",
+                "gwas_se",
+                "gwas_p",
+                "pqtl_beta",
+                "pqtl_se",
+                "pqtl_p",
+                "mr_method",
+                "n_instruments",
+                "mr_beta",
+                "mr_se",
+                "mr_pval",
+                "mr_fdr_q",
+                "q_pval",
+                "egger_intercept_pval",
+                "pp_h4_abf"
             ]
 
-            # we need another table with 
-            # A1 (or risk allele) in GWAS
-            # aligned to risk allele for pQTL and sc-eQTL 
-            # beta for each 
-            # pvalue on that specific thingy (of both top SNPs) (top pQTL SNP and top SMR SNP)
+            prioritised_cols = available_cols(mr_coloc_pass, prioritised_cols)
 
-            # so (top pQTL SNP)
-            # SNP (rsID)
-            # CHR
-            # POS (GRCh38)
-            # protein_id
-            # pheno_id
-            # pqtl_dataset
-            # A1 (risk allele) on GWAS
-            # A2
-            # Top pQTL SNP
-            # GWAS beta
-            # GWAS P
-            # pQTL beta
-            # pQTL P
-            # sc-eQTL beta
-            # sc-eQTL P
-            # ---- NOW THE SAME FOR THE TOP SMR SNP 
+            if "pp_h4_abf" in mr_coloc_pass.columns:
+                mr_coloc_pass = mr_coloc_pass.sort_values(
+                    ["pp_h4_abf", "mr_fdr_q"],
+                    ascending=[False, True],
+                    na_position="last"
+                )
 
+            overview_table = mr_coloc_pass[prioritised_cols].copy()
 
-            overview_cols = [col for col in overview_cols if col in final_multi_omics.columns]
-            st.success(f"{n_final} unique target(s) passed all multi-omics evidence chain.")
-            overview_cols = ["protein", "Gene", "cell_type", "pqtl_coloc_top_snp", "topSNP", "Wald_beta", "Wald_pval", "Wald_FDR_q", "pqtl_pp_h4", "q_SMR", "p_HEIDI", "eqtl_pp_h4", "moloc_model", "moloc_ppa"]
-            overview_cols = [col for col in overview_cols if col in overview_outcome.columns]
-            st.dataframe(overview_outcome[overview_cols], use_container_width=True, hide_index=True)
-            st.subheader("SNP-level evidence")
-            snp_cols = [
-                "protein",
-                "gene",
-                "cell_type",
-                "snp_type",
-                "SNP",
-                "CHR",
-                "POS",
-                "A1",
-                "A2",
-                "GWAS_beta",
-                "GWAS_SE",
-                "GWAS_P",
-                "pQTL_beta",
-                "pQTL_SE",
-                "pQTL_P",
-                "sc_eQTL_beta",
-                "sc_eQTL_SE",
-                "sc_eQTL_P"
-            ]
+            overview_column_names = {
+                "protein": "Protein",
+                "snp": "Top SNP",
+                "a1": "Risk allele",
+                "a2": "Other allele",
+                "frq": "Risk allele frequency",
+                "gwas_beta": "GWAS beta",
+                "gwas_se": "GWAS SE",
+                "gwas_p": "GWAS p-value",
+                "pqtl_beta": "pQTL beta",
+                "pqtl_se": "pQTL SE",
+                "pqtl_p": "pQTL p-value",
+                "mr_method": "MR method",
+                "n_instruments": "N instruments",
+                "mr_beta": "MR beta",
+                "mr_se": "MR SE",
+                "mr_pval": "MR p-value",
+                "mr_fdr_q": "MR FDR",
+                "q_pval": "Cochran Q p-value",
+                "egger_intercept_pval": "Egger intercept p-value",
+                "pp_h4_abf": "COLOC PP.H4"
+            }
 
-            snp_cols = [col for col in snp_cols if col in snp_outcome.columns]
-            st.dataframe(snp_outcome[snp_cols], use_container_width=True, hide_index=True)
+            overview_table = overview_table.rename(columns=overview_column_names)
+
+            st.success(
+                f"{n_mr_coloc} unique target(s) passed the selected cis-MR and pairwise COLOC thresholds."
+            )
+
+            st.caption(
+                "All SNP effects are harmonised to the outcome GWAS risk allele. "
+                "A positive pQTL beta means the risk allele increases protein abundance, "
+                "whereas a negative pQTL beta means the risk allele decreases protein abundance."
+            )
+
+            st.dataframe(
+                overview_table,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Risk allele frequency": st.column_config.NumberColumn(format="%.3f"),
+                    "GWAS beta": st.column_config.NumberColumn(format="%.4f"),
+                    "GWAS SE": st.column_config.NumberColumn(format="%.4f"),
+                    "GWAS p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "pQTL beta": st.column_config.NumberColumn(format="%.4f"),
+                    "pQTL SE": st.column_config.NumberColumn(format="%.4f"),
+                    "pQTL p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "MR beta": st.column_config.NumberColumn(format="%.4f"),
+                    "MR SE": st.column_config.NumberColumn(format="%.4f"),
+                    "MR p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "MR FDR": st.column_config.NumberColumn(format="%.3e"),
+                    "Cochran Q p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "Egger intercept p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "COLOC PP.H4": st.column_config.NumberColumn(format="%.3f")
+                }
+            )
+
+            st.download_button(
+                label="Download prioritised targets",
+                data=overview_table.to_csv(index=False, sep="\t"),
+                file_name=f"{pqtl_dataset}_{outcome}_prioritised_target_overview.tsv",
+                mime="text/tab-separated-values",
+                key="download_prioritised_targets_overview",
+                width="stretch"
+            )
 
         else:
-            st.info("No targets currently pass the complete multi-omics evidence chain.")
+            st.info("No proteins currently pass both the selected cis-MR and pQTL COLOC thresholds.")
+
+        if finngen_phewas_available or ukb_phewas_available:
+            st.caption(
+                f"FinnGen PheWAS results are available for {n_finngen_phewas} unique target(s); "
+                f"UKB PheWAS results are available for {n_ukb_phewas} unique target(s)."
+            )
 
     with tab2:
-        show_all_mr = st.checkbox("Show all tested cis-MR proteins", value=False)
+        st.subheader("cis-MR results")
+        st.caption(
+            "Wald ratio is used for proteins with one instrument. IVW is used for proteins "
+            "with more than one instrument."
+        )
+
+        show_all_mr = st.toggle("Show all tested cis-MR proteins", value=False)
         mr_display = mr_outcome if show_all_mr else mr_pass
         n_ivw = (mr_display["mr_method"] == "IVW").sum()
         n_wald = (mr_display["mr_method"] == "Wald ratio").sum()
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("MR proteins shown", mr_display["protein"].nunique())
-        col2.metric("IVW proteins", int(n_ivw))
-        col3.metric("Wald proteins", int(n_wald))
+        with st.container(border=True):
+            col1, col2, col3 = st.columns(3)
+            col1.metric("MR proteins shown", mr_display["protein"].nunique())
+            col2.metric("IVW proteins", int(n_ivw))
+            col3.metric("Wald proteins", int(n_wald))
 
         display_cols = [
             "protein",
@@ -546,9 +1189,18 @@ def dashboard(db_name: str, phenotype: str):
             "wald_fdr_q"
         ]
 
-        display_cols = [col for col in display_cols if col in mr_display.columns]
+        display_cols = available_cols(mr_display, display_cols)
         remaining_cols = [col for col in mr_display.columns if col not in display_cols]
-        st.dataframe(mr_display[display_cols + remaining_cols], use_container_width=True, hide_index=True)
+
+        st.subheader("MR association table")
+
+        st.dataframe(
+            mr_display[display_cols + remaining_cols],
+            width="stretch",
+            hide_index=True
+        )
+
+        st.divider()
 
         # primary MR volcano plot
         plot_df = mr_display[
@@ -558,6 +1210,8 @@ def dashboard(db_name: str, phenotype: str):
         ].copy()
 
         if not plot_df.empty:
+            st.subheader("MR effect landscape")
+
             plot_df["minus_log10_mr_pval"] = -np.log10(plot_df["mr_pval"])
             plot_df["significant"] = plot_df["mr_fdr_q"] < 0.05
 
@@ -567,6 +1221,7 @@ def dashboard(db_name: str, phenotype: str):
                 y="minus_log10_mr_pval",
                 hover_name="protein",
                 color="significant",
+                color_discrete_map=SIGNIFICANCE_COLOR_MAP,
                 symbol="mr_method",
                 hover_data={
                     "mr_method": True,
@@ -584,447 +1239,349 @@ def dashboard(db_name: str, phenotype: str):
                     "significant": "FDR < 0.05"
                 },
                 title="Primary cis-MR volcano plot",
-                height=600
+                height=600,
+                template="plotly_white"
             )
 
             fig.add_hline(y=-np.log10(0.05), line_dash="dash", line_color="grey")
             fig.add_vline(x=0, line_dash="dash", line_color="grey")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         else:
             st.info("No MR results remain after applying the selected filters.")
 
     with tab3:
-        st.subheader("pQTL–GWAS colocalisation")
-        col1, col2 = st.columns(2)
-        col1.metric("All COLOC-supported proteins", coloc_pass["protein"].nunique())
-        col2.metric("Proteins supported by cis-MR + COLOC", mr_coloc_pass["protein"].nunique())
-        coloc_tab1, coloc_tab2 = st.tabs(["All COLOC-supported proteins", "cis-MR + COLOC targets"])
+        st.subheader("cis-MR + pQTL–GWAS COLOC targets")
+        st.caption("Targets shown here pass both the selected cis-MR and pairwise pQTL–GWAS COLOC thresholds.")
 
-        with coloc_tab1:
-            st.dataframe(coloc_pass, use_container_width=True, hide_index=True)
+        if not mr_coloc_pass.empty:
+            with st.container(border=True):
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Prioritised proteins", mr_coloc_pass["protein"].nunique())
+                col2.metric("Median PP.H4", safe_median(mr_coloc_pass, "pp_h4_abf"))
+                col3.metric("Median MR FDR", safe_median(mr_coloc_pass, "mr_fdr_q", scientific=True))
 
-        with coloc_tab2:
-            if not mr_coloc_pass.empty:
-                prioritised_cols = [
-                    "protein",
-                    "mr_method",
-                    "n_instruments",
-                    "mr_beta",
-                    "mr_se",
-                    "mr_pval",
-                    "mr_fdr_q",
-                    "q_pval",
-                    "egger_intercept_pval",
-                    "pp_h0_abf",
-                    "pp_h1_abf",
-                    "pp_h2_abf",
-                    "pp_h3_abf",
-                    "pp_h4_abf"
-                ]
+            prioritised_cols = [
+                "protein",
+                "mr_method",
+                "n_instruments",
+                "mr_beta",
+                "mr_se",
+                "mr_pval",
+                "mr_fdr_q",
+                "q_pval",
+                "egger_intercept_pval",
+                "top_snp",
+                "pp_h0_abf",
+                "pp_h1_abf",
+                "pp_h2_abf",
+                "pp_h3_abf",
+                "pp_h4_abf"
+            ]
 
-                prioritised_cols = [col for col in prioritised_cols if col in mr_coloc_pass.columns]
-                remaining_cols = [col for col in mr_coloc_pass.columns if col not in prioritised_cols]
+            prioritised_cols = available_cols(mr_coloc_pass, prioritised_cols)
+            remaining_cols = [col for col in mr_coloc_pass.columns if col not in prioritised_cols]
 
-                if "pp_h4_abf" in mr_coloc_pass.columns:
-                    mr_coloc_pass = mr_coloc_pass.sort_values(["pp_h4_abf", "mr_fdr_q"], ascending=[False, True], na_position="last")
-
-                st.dataframe(mr_coloc_pass[prioritised_cols + remaining_cols], use_container_width=True, hide_index=True)
-
-                st.download_button(
-                    label="Download cis-MR + COLOC targets",
-                    data=mr_coloc_pass.to_csv(index=False, sep="\t"),
-                    file_name=f"{outcome}_prioritised_targets.tsv",
-                    mime="text/tab-separated-values"
+            if "pp_h4_abf" in mr_coloc_pass.columns:
+                mr_coloc_pass = mr_coloc_pass.sort_values(
+                    ["pp_h4_abf", "mr_fdr_q"],
+                    ascending=[False, True],
+                    na_position="last"
                 )
 
-            else:
-                st.info("No proteins currently pass both the selected cis-MR and pQTL COLOC thresholds.")
+            st.divider()
+            st.subheader("Prioritised target table")
 
-    with tab4:
-        st.subheader("Single-cell multi-omics evidence")
-
-        smr_tab, eqtl_tab, moloc_tab = st.tabs(["SMR + HEIDI", "GWAS–eQTL COLOC", "Three-trait MOLOC"])
-
-        with smr_tab:
-            col1, col2 = st.columns(2)
-            col1.metric("Target × cell-type SMR hits", len(smr_stage))
-            col2.metric("Unique proteins", smr_stage["protein"].nunique())
-
-            if not smr_stage.empty:
-                smr_cols = [
-                    "protein",
-                    "gene",
-                    "cell_type",
-                    "probeID",
-                    "top_snp",
-                    "b_smr",
-                    "se_smr",
-                    "p_smr",
-                    "q_smr",
-                    "p_heidi",
-                    "nsnp_HEIDI",
-                    "pqtl_dataset",
-                    "eqtl_dataset"
-                ]
-
-                smr_cols = [col for col in smr_cols if col in smr_stage.columns]
-                remaining_cols = [col for col in smr_stage.columns if col not in smr_cols]
-                st.dataframe(smr_stage[smr_cols + remaining_cols], use_container_width=True, hide_index=True)
-
-            else:
-                st.info("No target × cell-type pairs pass the selected SMR and HEIDI thresholds.")
-
-        with eqtl_tab:
-            col1, col2 = st.columns(2)
-            col1.metric("Target × cell-type eQTL COLOC hits", len(smr_eqtl_coloc_stage))
-            col2.metric("Unique proteins", smr_eqtl_coloc_stage["protein"].nunique())
-
-            if not smr_eqtl_coloc_stage.empty:
-                eqtl_cols = [
-                    "protein",
-                    "gene_smr",
-                    "cell_type",
-                    "top_snp_smr",
-                    "q_smr",
-                    "p_heidi",
-                    "top_snp_eqtl_coloc",
-                    "eqtl_pp_h0_abf",
-                    "eqtl_pp_h1_abf",
-                    "eqtl_pp_h2_abf",
-                    "eqtl_pp_h3_abf",
-                    "eqtl_pp_h4_abf",
-                    "n_eqtl_snps",
-                    "n_gwas_snps"
-                ]
-
-                eqtl_cols = [col for col in eqtl_cols if col in smr_eqtl_coloc_stage.columns]
-                remaining_cols = [col for col in smr_eqtl_coloc_stage.columns if col not in eqtl_cols]
-                st.dataframe(smr_eqtl_coloc_stage[eqtl_cols + remaining_cols], use_container_width=True, hide_index=True)
-
-            else:
-                st.info("No SMR-supported target × cell-type pairs pass GWAS–eQTL COLOC.")
-
-        with moloc_tab:
-            col1, col2 = st.columns(2)
-            col1.metric("Target × cell-type three-trait signals", len(final_multi_omics))
-            col2.metric("Unique proteins", final_multi_omics["protein"].nunique())
-
-            if not final_multi_omics.empty:
-                moloc_cols = [
-                    "protein",
-                    "gene_smr",
-                    "cell_type",
-                    "top_snp_smr",
-                    "q_smr",
-                    "p_heidi",
-                    "eqtl_pp_h4_abf",
-                    "moloc_model",
-                    "moloc_ppa",
-                    "nsnps_moloc"
-                ]
-
-                moloc_cols = [col for col in moloc_cols if col in final_multi_omics.columns]
-                remaining_cols = [col for col in final_multi_omics.columns if col not in moloc_cols]
-                st.dataframe(final_multi_omics[moloc_cols + remaining_cols], use_container_width=True, hide_index=True)
-
-            else:
-                st.info("No target × cell-type pairs pass the selected three-trait MOLOC threshold.")
-
-    with tab5:
-        st.subheader("Final multi-omics drug targets")
-        st.metric("Final unique targets", final_multi_omics["protein"].nunique())
-
-        if not final_multi_omics.empty:
-            selected_target = st.selectbox("Select final target", final_multi_omics["protein"].dropna().drop_duplicates().tolist())
-            target_data = final_multi_omics[final_multi_omics["protein"] == selected_target].copy()
-            selected_cell = st.selectbox("Cell type", target_data["cell_type"].dropna().drop_duplicates().tolist())
-            target_row = target_data[target_data["cell_type"] == selected_cell].iloc[0]
-            gene_col = "gene_smr" if "gene_smr" in target_row.index else "gene"
-
-            if gene_col in target_row.index:
-                st.markdown(f"### {target_row[gene_col]} `{selected_target}` in `{selected_cell}`")
-
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("SMR FDR q", f"{target_row['q_smr']:.2e}")
-            col2.metric("HEIDI p", f"{target_row['p_heidi']:.3f}")
-            col3.metric("GWAS–eQTL PP.H4", f"{target_row['eqtl_pp_h4_abf']:.3f}")
-            col4.metric("MOLOC abc PPA", f"{target_row['moloc_ppa']:.3f}")
-
-            st.success(
-                f"{selected_target} in {selected_cell} is supported by cis-pQTL MR, pQTL–GWAS colocalisation, "
-                "cell-type SMR with a non-significant HEIDI test, GWAS–eQTL colocalisation and three-trait MOLOC."
+            st.dataframe(
+                mr_coloc_pass[prioritised_cols + remaining_cols],
+                width="stretch",
+                hide_index=True
             )
 
-            final_cols = [
+            st.download_button(
+                label="Download prioritised targets",
+                data=mr_coloc_pass.to_csv(index=False, sep="\t"),
+                file_name=f"{outcome}_prioritised_targets.tsv",
+                mime="text/tab-separated-values",
+                key="download_prioritised_targets_coloc",
+                width="stretch"
+            )
+
+        else:
+            st.info("No proteins currently pass both the selected cis-MR and pQTL COLOC thresholds.")
+
+    with tab4:
+        render_phewas_section(
+            phewas_outcome=finngen_phewas_outcome,
+            mr_coloc_pass=mr_coloc_pass,
+            source_name="FinnGen",
+            source_description="FinnGen phenotype (ICD coded)",
+            n_endpoints=2511,
+            pqtl_dataset=pqtl_dataset,
+            outcome=outcome,
+            key_prefix="finngen"
+        )
+
+    with tab5:
+        render_phewas_section(
+            phewas_outcome=ukb_phewas_outcome,
+            mr_coloc_pass=mr_coloc_pass,
+            source_name="UKB TOPMed",
+            source_description="UK Biobank EHR-derived PheCode phenotype",
+            n_endpoints=1419,
+            pqtl_dataset=pqtl_dataset,
+            outcome=outcome,
+            key_prefix="ukb"
+        )
+
+    with tab6:
+        st.subheader("SMR (bulk / single-cell eQTL)")
+        st.caption(
+            "Targets shown here already passed cis-MR + pQTL–GWAS COLOC, and additionally "
+            "passed SMR (FDR-corrected) + HEIDI in the configured bulk and/or single-cell eQTL "
+            "dataset(s). Alleles are aligned to the AD risk allele, same convention as the "
+            "cis-MR/COLOC top-hit table."
+        )
+
+        if smr_display.empty:
+            st.info("No SMR results are available for this pQTL dataset yet.")
+        else:
+            smr_filtered = smr_display.copy()
+
+            if "data_type" in smr_filtered.columns:
+                available_data_types = ["All"] + sorted(smr_filtered["data_type"].dropna().unique().tolist())
+
+                data_type_choice = st.segmented_control(
+                    "eQTL data type",
+                    available_data_types,
+                    default="All",
+                    selection_mode="single",
+                    key="smr_data_type_selector"
+                )
+
+                if data_type_choice and data_type_choice != "All":
+                    smr_filtered = smr_filtered[smr_filtered["data_type"] == data_type_choice]
+
+            if "cell_type" in smr_filtered.columns:
+                available_cell_types = sorted(smr_filtered["cell_type"].dropna().unique().tolist())
+                selected_cell_types = st.multiselect(
+                    "Cell type ('bulk' rows have no single cell-type)",
+                    available_cell_types,
+                    default=available_cell_types
+                )
+
+                if selected_cell_types:
+                    smr_filtered = smr_filtered[smr_filtered["cell_type"].isin(selected_cell_types)]
+
+            with st.container(border=True):
+                metric1, metric2 = st.columns(2)
+                metric1.metric("Unique targets shown", safe_nunique(smr_filtered, "protein"))
+                metric2.metric("Target x cell/bulk rows", len(smr_filtered))
+
+            st.divider()
+            st.subheader("Target support landscape")
+            st.caption(
+                "Each cell is a target that passed cis-MR + COLOC + SMR + HEIDI in that cell "
+                "type or bulk/tissue dataset. Color intensity is -log10(SMR FDR); blank cells "
+                "mean that target did not pass in that context."
+            )
+
+            heatmap_df = smr_filtered[
+                smr_filtered["q_smr"].notna() & (smr_filtered["q_smr"] > 0)
+            ].copy() if "q_smr" in smr_filtered.columns else pd.DataFrame()
+
+            if not heatmap_df.empty:
+                heatmap_df["neg_log10_q_smr"] = -np.log10(heatmap_df["q_smr"])
+                pivot = heatmap_df.pivot_table(
+                    index="protein",
+                    columns="cell_type",
+                    values="neg_log10_q_smr",
+                    aggfunc="max"
+                )
+                # most broadly-supported targets (fewest blank cells) first
+                pivot = pivot.loc[pivot.notna().sum(axis=1).sort_values(ascending=False).index]
+
+                heatmap_fig = px.imshow(
+                    pivot,
+                    color_continuous_scale=SEQUENTIAL_SCALE,
+                    aspect="auto",
+                    labels={"color": "-log10(SMR FDR)", "x": "Cell type / bulk dataset", "y": "Protein"},
+                    title="Target x cell-type/tissue SMR support"
+                )
+                heatmap_fig.update_layout(height=max(400, 32 * len(pivot)))
+                st.plotly_chart(heatmap_fig, width="stretch")
+            else:
+                st.info("No targets with a valid SMR FDR value to plot.")
+
+            st.divider()
+
+            smr_cols = [
                 "protein",
-                "gene_smr",
+                "data_type",
                 "cell_type",
-                "probeID",
-                "top_snp_smr",
+                "gene",
+                "a1",
+                "a2",
+                "b_gwas",
+                "b_eqtl",
                 "b_smr",
-                "se_smr",
                 "p_smr",
                 "q_smr",
                 "p_heidi",
-                "nsnp_HEIDI",
-                "eqtl_pp_h4_abf",
-                "moloc_model",
-                "moloc_ppa",
-                "nsnps_moloc"
+                "eqtl_dataset"
             ]
 
-            final_cols = [col for col in final_cols if col in final_multi_omics.columns]
-            st.dataframe(final_multi_omics[final_cols], use_container_width=True, hide_index=True)
+            smr_cols = available_cols(smr_filtered, smr_cols)
+            remaining_smr_cols = [col for col in smr_filtered.columns if col not in smr_cols]
 
-            with st.expander("View complete merged multi-omics evidence"):
-                st.dataframe(final_multi_omics, use_container_width=True, hide_index=True)
+            smr_table = smr_filtered[smr_cols + remaining_smr_cols].copy()
+
+            smr_column_names = {
+                "protein": "Protein",
+                "data_type": "Data type",
+                "cell_type": "Cell type",
+                "gene": "Gene",
+                "a1": "Risk allele",
+                "a2": "Other allele",
+                "b_gwas": "GWAS beta (risk allele)",
+                "b_eqtl": "eQTL beta (risk allele)",
+                "b_smr": "SMR beta",
+                "p_smr": "SMR p-value",
+                "q_smr": "SMR FDR",
+                "p_heidi": "HEIDI p-value",
+                "eqtl_dataset": "eQTL dataset"
+            }
+
+            smr_table = smr_table.rename(columns=smr_column_names)
+
+            st.dataframe(
+                smr_table,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "GWAS beta (risk allele)": st.column_config.NumberColumn(format="%.4f"),
+                    "eQTL beta (risk allele)": st.column_config.NumberColumn(format="%.4f"),
+                    "SMR beta": st.column_config.NumberColumn(format="%.4f"),
+                    "SMR p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "SMR FDR": st.column_config.NumberColumn(format="%.3e"),
+                    "HEIDI p-value": st.column_config.NumberColumn(format="%.3e")
+                }
+            )
 
             st.download_button(
-                label="Download final multi-omics targets",
-                data=final_multi_omics.to_csv(index=False, sep="\t"),
-                file_name=f"{outcome}_final_multi_omics_targets.tsv",
-                mime="text/tab-separated-values"
+                label="Download SMR hits",
+                data=smr_table.to_csv(index=False, sep="\t"),
+                file_name=f"{pqtl_dataset}_{phenotype}_SMR_hits.tsv",
+                mime="text/tab-separated-values",
+                key="download_smr_hits",
+                width="stretch"
             )
 
-            st.write("Final targets passing the complete evidence chain:")
+    with tab7:
+        st.subheader("Final Targets")
+        st.caption(
+            "The complete set of targets which passed cis-MR + pQTL–GWAS COLOC + SMR + HEIDI, "
+            "broken down by the cell type or bulk/tissue dataset each was supported in. For "
+            "single-cell rows, the eQTL beta is sourced from the original per-cell-type eQTL "
+            "file rather than the raw SMR output (SMR's own allele coding doesn't always match "
+            "the original file's effect allele)."
+        )
 
-            for target in final_multi_omics["protein"].drop_duplicates().tolist():
-                cells = final_multi_omics[final_multi_omics["protein"] == target]["cell_type"].drop_duplicates().tolist()
-                st.code(f"{target}: {', '.join(cells)}")
-
+        if smr_display.empty:
+            st.info("No SMR results are available for this pQTL dataset yet.")
         else:
-            st.info(
-                "No targets currently pass cis-MR, pQTL COLOC, single-cell SMR/HEIDI, "
-                "GWAS–eQTL COLOC and three-trait MOLOC using the selected thresholds."
-            )
+            final_targets = smr_display.sort_values(
+                ["protein", "cell_type"],
+                na_position="last"
+            ) if "cell_type" in smr_display.columns else smr_display.copy()
 
-
-    with tab6:
-        st.subheader("FinnGen PheWAS safety assessment")
-
-        if phewas_outcome.empty:
-            st.info("No local PheWAS safety results are available for this outcome.")
-
-        elif "protein" not in phewas_outcome.columns:
-            st.error("The PheWAS result file does not contain a protein column.")
-
-        else:
-            phewas_targets = sorted(phewas_outcome["protein"].dropna().astype(str).unique())
-
-            if len(phewas_targets) == 0:
-                st.info("No proteins were found in the PheWAS safety table.")
-
-            else:
-                default_phewas_target = 0
-                final_target_names = final_multi_omics["protein"].dropna().astype(str).unique().tolist()
-
-                for target in final_target_names:
-                    if target in phewas_targets:
-                        default_phewas_target = phewas_targets.index(target)
-                        break
-
-                selected_phewas_target = st.selectbox(
-                    "Select target for PheWAS",
-                    phewas_targets,
-                    index=default_phewas_target,
-                    key="selected_phewas_target"
+            # pQTL beta is per-protein (not per-cell-type) - bring it in from the
+            # harmonised top cis-hit table, already aligned to the same risk allele
+            # convention as the SMR file's own A1 (both scripts align A1 the same way)
+            if not target_info.empty and "protein" in target_info.columns and "pqtl_beta" in target_info.columns:
+                final_targets = final_targets.merge(
+                    target_info[["protein", "pqtl_beta"]],
+                    on="protein",
+                    how="left"
                 )
 
-                target_phewas = phewas_outcome[
-                    phewas_outcome["protein"].astype(str) == selected_phewas_target
-                ].copy()
+            with st.container(border=True):
+                metric1, metric2 = st.columns(2)
+                metric1.metric("Unique targets", safe_nunique(final_targets, "protein"))
+                metric2.metric("Target x cell/bulk rows", len(final_targets))
 
-                p_col = None
-                beta_col = None
-                fdr_col = None
+            st.divider()
 
-                for col in ["p_wald_ratio", "pval"]:
-                    if col in target_phewas.columns:
-                        p_col = col
-                        break
+            final_cols = [
+                "protein",
+                "gene",
+                "data_type",
+                "cell_type",
+                "topsnp",
+                "topsnp_chr",
+                "topsnp_bp",
+                "a1",
+                "a2",
+                "b_gwas",
+                "pqtl_beta",
+                "b_eqtl",
+                "b_smr",
+                "p_smr",
+                "q_smr",
+                "p_heidi"
+            ]
 
-                for col in ["wald_ratio", "beta"]:
-                    if col in target_phewas.columns:
-                        beta_col = col
-                        break
+            final_cols = available_cols(final_targets, final_cols)
+            final_table = final_targets[final_cols].copy()
 
-                for col in ["q_fdr_wald_ratio", "fdr_q", "qval"]:
-                    if col in target_phewas.columns:
-                        fdr_col = col
-                        break
+            final_column_names = {
+                "protein": "Target",
+                "gene": "Gene",
+                "data_type": "Data type",
+                "cell_type": "Cell type",
+                "topsnp": "Top SNP",
+                "topsnp_chr": "Chr",
+                "topsnp_bp": "Position (bp)",
+                "a1": "Risk allele",
+                "a2": "Other allele",
+                "b_gwas": "GWAS beta",
+                "pqtl_beta": "pQTL beta",
+                "b_eqtl": "eQTL beta",
+                "b_smr": "SMR beta",
+                "p_smr": "SMR p-value",
+                "q_smr": "SMR FDR",
+                "p_heidi": "HEIDI p-value"
+            }
 
-                if p_col is None or beta_col is None:
-                    st.error(
-                        "The PheWAS result file needs an effect column "
-                        "(wald_ratio or beta) and a p-value column "
-                        "(p_wald_ratio or pval)."
-                    )
+            final_table = final_table.rename(columns=final_column_names)
 
-                else:
-                    target_phewas = target_phewas[
-                        target_phewas[p_col].notna() &
-                        target_phewas[beta_col].notna() &
-                        (target_phewas[p_col] > 0)
-                    ].copy()
+            st.caption("Betas are all aligned to the outcome (AD) risk allele shown in **Risk allele**.")
 
-                    if target_phewas.empty:
-                        st.info(f"No valid PheWAS associations were found for {selected_phewas_target}.")
+            st.dataframe(
+                final_table,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Chr": st.column_config.NumberColumn(format="%d"),
+                    "Position (bp)": st.column_config.NumberColumn(format="%d"),
+                    "GWAS beta": st.column_config.NumberColumn(format="%.4f"),
+                    "pQTL beta": st.column_config.NumberColumn(format="%.4f"),
+                    "eQTL beta": st.column_config.NumberColumn(format="%.4f"),
+                    "SMR beta": st.column_config.NumberColumn(format="%.4f"),
+                    "SMR p-value": st.column_config.NumberColumn(format="%.3e"),
+                    "SMR FDR": st.column_config.NumberColumn(format="%.3e"),
+                    "HEIDI p-value": st.column_config.NumberColumn(format="%.3e")
+                }
+            )
 
-                    else:
-                        target_phewas["minus_log10_p"] = -np.log10(target_phewas[p_col])
-
-                        if fdr_col is not None:
-                            target_phewas["fdr_significant"] = target_phewas[fdr_col].fillna(np.inf) <= 0.05
-                        elif "fdr_significant" not in target_phewas.columns:
-                            target_phewas["fdr_significant"] = False
-
-                        phenotype_col = "phenostring" if "phenostring" in target_phewas.columns else "phenocode"
-                        category_col = "category" if "category" in target_phewas.columns else None
-
-                        n_phenotypes = target_phewas[phenotype_col].nunique()
-                        n_nominal = int((target_phewas[p_col] < 0.05).sum())
-                        n_fdr = int(target_phewas["fdr_significant"].sum())
-
-                        metric1, metric2, metric3 = st.columns(3)
-                        metric1.metric("FinnGen phenotypes tested", int(n_phenotypes))
-                        metric2.metric("Nominal associations", n_nominal)
-                        metric3.metric("FDR-significant associations", n_fdr)
-
-                        st.caption(
-                            "PheWAS effect estimates show the association of the selected cis-pQTL instrument "
-                            "with each FinnGen phenotype. Positive and negative directions should be interpreted "
-                            "after checking the aligned effect allele."
-                        )
-
-                        plot_kwargs = {
-                            "data_frame": target_phewas,
-                            "x": beta_col,
-                            "y": "minus_log10_p",
-                            "hover_name": phenotype_col,
-                            "symbol": "fdr_significant",
-                            "hover_data": {
-                                beta_col: ":.4f",
-                                p_col: ":.3e",
-                                "minus_log10_p": False,
-                                "fdr_significant": True
-                            },
-                            "labels": {
-                                beta_col: "PheWAS effect estimate",
-                                "minus_log10_p": "-log10(PheWAS p-value)",
-                                "fdr_significant": "FDR significant"
-                            },
-                            "title": f"FinnGen PheWAS profile: {selected_phewas_target}",
-                            "height": 600
-                        }
-
-                        if "phenocode" in target_phewas.columns:
-                            plot_kwargs["hover_data"]["phenocode"] = True
-
-                        if category_col is not None:
-                            plot_kwargs["color"] = category_col
-                            plot_kwargs["labels"][category_col] = "FinnGen category"
-
-                        phewas_fig = px.scatter(**plot_kwargs)
-                        phewas_fig.add_hline(y=-np.log10(0.05), line_dash="dash", line_color="grey")
-                        phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
-                        st.plotly_chart(phewas_fig, use_container_width=True)
-
-                        st.subheader("FDR-significant PheWAS associations")
-
-                        top_phewas = target_phewas[target_phewas["fdr_significant"]].copy()
-
-                        if fdr_col is not None:
-                            top_phewas = top_phewas.sort_values(fdr_col, ascending=True)
-                        else:
-                            top_phewas = top_phewas.sort_values(p_col, ascending=True)
-
-                        top_phewas = top_phewas.sort_values(beta_col, ascending=True)
-
-                        if top_phewas.empty:
-                            st.info(
-                                f"No FinnGen phenotype associations survive FDR correction for "
-                                f"{selected_phewas_target}."
-                            )
-
-                        else:
-                            top_plot_kwargs = {
-                                "data_frame": top_phewas,
-                                "x": beta_col,
-                                "y": phenotype_col,
-                                "hover_data": {
-                                    beta_col: ":.4f",
-                                    p_col: ":.3e",
-                                    "minus_log10_p": ":.3f"
-                                },
-                                "labels": {
-                                    beta_col: "PheWAS effect estimate",
-                                    phenotype_col: ""
-                                },
-                                "title": "FDR-significant PheWAS associations",
-                                "height": max(450, 45 * len(top_phewas))
-                            }
-
-                            if "phenocode" in top_phewas.columns:
-                                top_plot_kwargs["hover_data"]["phenocode"] = True
-
-                            if category_col is not None:
-                                top_plot_kwargs["color"] = category_col
-                                top_plot_kwargs["labels"][category_col] = "FinnGen category"
-
-                            top_phewas_fig = px.scatter(**top_plot_kwargs)
-                            top_phewas_fig.add_vline(x=0, line_dash="dash", line_color="grey")
-                            st.plotly_chart(top_phewas_fig, use_container_width=True)
-
-                        phewas_cols = [
-                            "protein",
-                            "SNP",
-                            "phenocode",
-                            "phenostring",
-                            "category",
-                            beta_col,
-                            p_col,
-                            fdr_col,
-                            "fdr_significant"
-                        ]
-
-                        phewas_cols = [
-                            col for col in phewas_cols
-                            if col is not None and col in target_phewas.columns
-                        ]
-
-                        significant_phewas = target_phewas[
-                            target_phewas["fdr_significant"]
-                        ].copy()
-
-                        if fdr_col is not None:
-                            significant_phewas = significant_phewas.sort_values(fdr_col, ascending=True)
-                        else:
-                            significant_phewas = significant_phewas.sort_values(p_col, ascending=True)
-
-                        if significant_phewas.empty:
-                            st.success("No FinnGen phenotype associations survive FDR correction for this target.")
-                        else:
-                            st.dataframe(
-                                significant_phewas[phewas_cols],
-                                use_container_width=True,
-                                hide_index=True
-                            )
-
-                        with st.expander("View all PheWAS associations"):
-                            remaining_cols = [col for col in target_phewas.columns if col not in phewas_cols]
-                            st.dataframe(
-                                target_phewas[phewas_cols + remaining_cols].sort_values(p_col, ascending=True),
-                                use_container_width=True,
-                                hide_index=True
-                            )
-
-                        st.download_button(
-                            label=f"Download {selected_phewas_target} PheWAS results",
-                            data=target_phewas.to_csv(index=False, sep="\t"),
-                            file_name=f"{selected_phewas_target}_{outcome}_FinnGen_PheWAS.tsv",
-                            mime="text/tab-separated-values"
-                        )
+            st.download_button(
+                label="Download final targets",
+                data=final_table.to_csv(index=False, sep="\t"),
+                file_name=f"{pqtl_dataset}_{phenotype}_final_targets.tsv",
+                mime="text/tab-separated-values",
+                key="download_final_targets",
+                width="stretch"
+            )
 
 
 def main():
@@ -1032,9 +1589,15 @@ def main():
     p.add_argument("--db_name", required=True, type=str)
     p.add_argument("--port_number", required=True, type=str)
     p.add_argument("--phenotype", required=True, type=str)
+    p.add_argument("--pqtl_dataset", required=True, type=str)
     args = p.parse_args()
     create_streamlit_ammenities(args.db_name, args.port_number)
-    dashboard(args.db_name, args.phenotype)
+    dashboard(
+        db_name=args.db_name,
+        port_number=args.port_number,
+        phenotype=args.phenotype,
+        pqtl_dataset=args.pqtl_dataset
+    )
 
 
 if __name__ == "__main__":
