@@ -398,7 +398,39 @@ apptainer exec --bind "{remote}:/work" \\
     --mediator_manifest {mediator_manifest}"
 """, falcon_user)
 
-# get final snp-wide hits 
+# RUN SMR (bulk or single-cell, depending on eqtl_mode)
+# named run_smr_step (not run_smr) to avoid clashing with the run_smr config flag in hpc()
+def run_smr_step(
+    falcon_user: str,
+    pqtl_dataset: str,
+    eqtl_dataset: str,
+    eqtl_mode: str,
+    pheno_id: str,
+    sumstats: str,
+    ref_bfile: str,
+    maf: float
+):
+    remote, sif = get_remote_paths(falcon_user)
+
+    ssh(f"""
+set -euo pipefail
+cd "{remote}"
+
+apptainer exec --bind "{remote}:/work" \\
+  --env PYTHONPATH=. \\
+  "{sif}" \\
+  bash -c "cd /work && python bin/sort_smr.py \\
+    --pheno_id {pheno_id} \\
+    --sumstats {sumstats} \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {eqtl_dataset} \\
+    --eqtl_mode {eqtl_mode} \\
+    --ref_bfile {ref_bfile} \\
+    --maf {maf}"
+""", falcon_user)
+
+
+# get final snp-wide hits
 def compile_top_hits(
     falcon_user: str,
     pheno_id: str,
@@ -605,16 +637,20 @@ def pull_results_local(
     remote_mr = f"{remote}/results/cis-MR/{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     remote_coloc = f"{remote}/results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     remote_target_stats = f"{remote}/results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
+    remote_smr = f"{remote}/results/SMR/{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
     local_results_dir = Path(local_results_dir)
     local_mr_dir = local_results_dir / "cis-MR"
     local_coloc_dir = local_results_dir / "coloc" / pqtl_dataset
     local_target_stats_dir = local_results_dir / "target_stats" / pqtl_dataset / pheno_id
+    local_smr_dir = local_results_dir / "SMR"
     local_mr_dir.mkdir(parents=True, exist_ok=True)
     local_coloc_dir.mkdir(parents=True, exist_ok=True)
     local_target_stats_dir.mkdir(parents=True, exist_ok=True)
+    local_smr_dir.mkdir(parents=True, exist_ok=True)
     local_mr = local_mr_dir / f"{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     local_coloc = local_coloc_dir / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     local_target_stats = local_target_stats_dir / f"{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
+    local_smr = local_smr_dir / f"{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
     for remote_file, local_file in [
         (remote_mr, local_mr),
         (remote_coloc, local_coloc),
@@ -631,6 +667,26 @@ def pull_results_local(
         print(cmd)
         subprocess.run(cmd, shell=True, check=True)
         print(f"[DONE] Pulled results into {local_file}")
+
+    # SMR is optional (bulk and/or single-cell, gated by run_smr) so only pull it
+    # down if it was actually produced remotely
+    if local_smr.exists() and not overwrite:
+        print(f"[TRACKING] {local_smr} already exists locally. Skipping pull.")
+    else:
+        remote_smr_check = check_remote_output(
+            falcon_user=falcon_user,
+            path=f"results/SMR/{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv",
+            step="SMR",
+            overwrite=False
+        )
+
+        if remote_smr_check:
+            cmd = f"scp {falcon_user}@falconlogin.cf.ac.uk:{remote_smr} {local_smr}"
+            print(cmd)
+            subprocess.run(cmd, shell=True, check=True)
+            print(f"[DONE] Pulled results into {local_smr}")
+        else:
+            print("[TRACKING] No remote SMR output found - skipping SMR pull.")
 
 
 # STREAMLIT DASHBOARD
@@ -661,6 +717,7 @@ def check_outputs(
     mr_res = f"results/cis-MR/{pqtl_dataset}_{pheno_id}_all_MR.tsv"
     coloc_res = f"results/coloc/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
     target_stats_res = f"results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv"
+    smr_res = f"results/SMR/{pqtl_dataset}_{pheno_id}_final_multi_omics_targets.tsv"
 
     ssh(f"""
 set -euo pipefail
@@ -688,6 +745,14 @@ if [ -s "{target_stats_res}" ]; then
     head -5 "{target_stats_res}"
 else
     echo "[CONCERN] Top cis-hit compilation output not found or empty"
+fi
+
+echo "[TRACKING] Checking SMR output..."
+if [ -s "{smr_res}" ]; then
+    ls -lh "{smr_res}"
+    head -5 "{smr_res}"
+else
+    echo "[CONCERN] SMR output not found or empty (SMR may not be configured for this run)"
 fi
 """, falcon_user)
 
@@ -724,6 +789,9 @@ def hpc(config: str = "assets/config.yaml"):
     remove_apoe = getattr(cfg, "remove_apoe", False)
     local_results_dir = getattr(cfg, "local_results_dir", "results")
     overwrite = getattr(cfg, "overwrite", False)
+    run_smr = getattr(cfg, "run_smr", True)
+    bulk_eqtl_datasets = getattr(cfg, "bulk_eqtl_datasets", [])
+    sc_eqtl_dataset = getattr(cfg, "sc_eqtl_dataset", "")
 
     # define all outputs first so pipeline knows what has already been ran
     qc_out = f"{out_dir}/QC/{pheno_id}/{pheno_id}.tsv"
@@ -733,6 +801,12 @@ def hpc(config: str = "assets/config.yaml"):
     # change this where NetworkMR saves its final compiled output
     network_mr_out = f"results/network-MR/{pqtl_dataset}/{pqtl_dataset}_{pheno_id}_network_MR.tsv"
     target_stats_out = (f"results/target_stats/{pqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_top_cis_hits.tsv")
+
+    # SMR (bulk and/or single-cell) - promising target output per eQTL mode
+    # bulk_eqtl_datasets is a list (eQTLGen / MetaBrain / GTEx_v10 etc. are pre-computed
+    # separately under results/SMR/bulk/{dataset}/) so its per-dataset outputs are built
+    # inside the SMR step below rather than up front here
+    smr_sc_out = f"results/SMR/sc/{sc_eqtl_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
 
     print("[TRACKING] Preparing Falcon repo...")
     clone_repo(falcon_user)
@@ -908,6 +982,59 @@ def hpc(config: str = "assets/config.yaml"):
         step="Top cis-hit compilation",
         required_for="Dashboard target information"
     )
+
+    # SMR module (bulk and/or single-cell eQTL, run right after coloc + top-cis-hit compilation)
+    # -> targets which survive cis-MR + COLOC are checked against SMR + HEIDI in the
+    #    configured eQTL dataset(s), alleles aligned to the AD risk allele
+    if run_smr:
+        if bulk_eqtl_datasets:
+            # bulk eQTL SMR (eQTLGen / MetaBrain / GTEx_v10) is pre-computed elsewhere -
+            # bin/sort_smr.py ingests results/SMR/bulk/{dataset}/ rather than re-running SMR
+            for bulk_dataset in bulk_eqtl_datasets:
+                smr_bulk_out = f"results/SMR/bulk/{bulk_dataset}/{pheno_id}/{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
+
+                if not check_remote_output(
+                    falcon_user=falcon_user,
+                    path=smr_bulk_out,
+                    step=f"Bulk SMR ({bulk_dataset})",
+                    overwrite=overwrite
+                ):
+                    print(f"[TRACKING] Ingesting pre-computed bulk eQTL SMR for {bulk_dataset}...")
+                    run_smr_step(
+                        falcon_user=falcon_user,
+                        pqtl_dataset=pqtl_dataset,
+                        eqtl_dataset=bulk_dataset,
+                        eqtl_mode="bulk",
+                        pheno_id=pheno_id,
+                        sumstats=qc_out,
+                        ref_bfile=ref_bfile,
+                        maf=maf,
+                    )
+        else:
+            print("[TRACKING] No bulk_eqtl_datasets specified, skipping bulk SMR.")
+
+        if sc_eqtl_dataset:
+            if not check_remote_output(
+                falcon_user=falcon_user,
+                path=smr_sc_out,
+                step="Single-cell SMR",
+                overwrite=overwrite
+            ):
+                print("[TRACKING] Running single-cell eQTL SMR...")
+                run_smr_step(
+                    falcon_user=falcon_user,
+                    pqtl_dataset=pqtl_dataset,
+                    eqtl_dataset=sc_eqtl_dataset,
+                    eqtl_mode="single_cell",
+                    pheno_id=pheno_id,
+                    sumstats=qc_out,
+                    ref_bfile=ref_bfile,
+                    maf=maf,
+                )
+        else:
+            print("[TRACKING] No sc_eqtl_dataset specified, skipping single-cell SMR.")
+    else:
+        print("[TRACKING] run_smr is False, skipping SMR entirely.")
 
     print("[TRACKING] Checking outputs...")
     check_outputs(

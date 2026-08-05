@@ -199,7 +199,10 @@ def local(config: str = "assets/config.yaml"):
     overwrite = getattr(cfg, "overwrite", False)
     image_uri = getattr(cfg, "image_uri", "ghcr.io/guillermocomesanacimadevila/drugmr:latest")
     image_name = getattr(cfg, "image_name", "ghcr.io/guillermocomesanacimadevila/drugmr:latest")
-    
+    run_smr = getattr(cfg, "run_smr", True)
+    bulk_eqtl_datasets = getattr(cfg, "bulk_eqtl_datasets", [])
+    sc_eqtl_dataset = getattr(cfg, "sc_eqtl_dataset", "")
+
 
     # set projectDir()
     project_root = Path(__file__).resolve().parents[1] # i.e. "Users/.../drugMR"
@@ -216,6 +219,20 @@ def local(config: str = "assets/config.yaml"):
         / f"{pqtl_dataset}_{pheno_id}_all_MR_instruments.tsv"
     )
     coloc_out = project_root / "results" / "coloc" / pqtl_dataset / f"{pqtl_dataset}_{pheno_id}_all_coloc.tsv"
+
+    # SMR (bulk and/or single-cell) - promising target output per eQTL mode
+    # bulk_eqtl_datasets is a list (eQTLGen / MetaBrain / GTEx_v10 etc. are pre-computed
+    # separately under results/SMR/bulk/{dataset}/) so its per-dataset outputs are built
+    # inside the SMR step below rather than up front here
+    smr_sc_out = (
+        project_root
+        / "results"
+        / "SMR"
+        / "sc"
+        / sc_eqtl_dataset
+        / pheno_id
+        / f"{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
+    )
 
     # final harmonised target stats
     target_stats_out = (
@@ -518,6 +535,73 @@ docker run --rm \
         "Top cis-hit compilation",
         "pipeline completion"
     )
+
+    # SMR module (bulk and/or single-cell eQTL, run right after coloc + top-cis-hit compilation)
+    # -> targets which survive cis-MR + COLOC are checked against SMR + HEIDI in the
+    #    configured eQTL dataset(s), alleles aligned to the AD risk allele
+    if run_smr:
+        if bulk_eqtl_datasets:
+            # bulk eQTL SMR (eQTLGen / MetaBrain / GTEx_v10) is pre-computed elsewhere -
+            # bin/sort_smr.py ingests results/SMR/bulk/{dataset}/ rather than re-running SMR
+            for bulk_dataset in bulk_eqtl_datasets:
+                smr_bulk_out = (
+                    project_root
+                    / "results"
+                    / "SMR"
+                    / "bulk"
+                    / bulk_dataset
+                    / pheno_id
+                    / f"{pqtl_dataset}_{pheno_id}_promising_targets_SMR.tsv"
+                )
+
+                cmd_smr_bulk = f"""
+set -euo pipefail
+docker run --rm \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/sort_smr.py \\
+    --pheno_id {pheno_id} \\
+    --sumstats {out_dir}/QC/{pheno_id}/{pheno_id}.tsv \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {bulk_dataset} \\
+    --eqtl_mode bulk \\
+    --ref_bfile {ref_bfile} \\
+    --maf {maf}
+"""
+
+                if not check_output(smr_bulk_out, f"Bulk SMR ({bulk_dataset})", overwrite):
+                    print(f"[TRACKING] Ingesting pre-computed bulk eQTL SMR for {bulk_dataset} via Docker...")
+                    cmd_base(cmd_smr_bulk)
+        else:
+            print("[TRACKING] No bulk_eqtl_datasets specified, skipping bulk SMR.")
+
+        if sc_eqtl_dataset:
+            cmd_smr_sc = f"""
+set -euo pipefail
+docker run --rm \\
+  -v "{project_root}:/work" \\
+  -w /work \\
+  -e PYTHONPATH=. \\
+  "{image_name}" \\
+  python bin/sort_smr.py \\
+    --pheno_id {pheno_id} \\
+    --sumstats {out_dir}/QC/{pheno_id}/{pheno_id}.tsv \\
+    --pqtl_dataset {pqtl_dataset} \\
+    --eqtl_dataset {sc_eqtl_dataset} \\
+    --eqtl_mode single_cell \\
+    --ref_bfile {ref_bfile} \\
+    --maf {maf}
+"""
+
+            if not check_output(smr_sc_out, "Single-cell SMR", overwrite):
+                print("[TRACKING] Running single-cell eQTL SMR locally via Docker...")
+                cmd_base(cmd_smr_sc)
+        else:
+            print("[TRACKING] No sc_eqtl_dataset specified, skipping single-cell SMR.")
+    else:
+        print("[TRACKING] run_smr is False, skipping SMR entirely.")
 
     # PheWAS stuff (for FinnGen)
     cmd_phewas = f"""
