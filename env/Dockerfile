@@ -95,11 +95,11 @@ ENV PATH="/opt/conda/envs/drugmr/bin:$PATH"
 # SMR + GCTA
 USER root
 
-# COPY dat/ref/SMR/smr /usr/local/bin/smr
+COPY dat/ref/SMR/smr /usr/local/bin/smr
 
-# RUN chmod +x /usr/local/bin/smr && \
-#     /usr/local/bin/smr --help >/dev/null 2>&1 || \
-#    /usr/local/bin/smr 2>&1 | head
+RUN chmod +x /usr/local/bin/smr && \
+    /usr/local/bin/smr --help >/dev/null 2>&1 || \
+    /usr/local/bin/smr 2>&1 | head
 
 # Bioconda installs GCTA as gcta64.
 # Keep the shorter `gcta` command for the pipeline.
