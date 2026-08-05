@@ -14,9 +14,12 @@
   pos_col: BP                                                # Position column name in outcome GWAS
   chr_col: CHR                                               # Chromosome column name in outcome GWAS
   af_col: FRQ                                                # Minor allele frequency column name in outcome GWAS
-  pqtl_dataset: ukb_ppp                                      # pQTL dataset ID (ukb-ppp or deCODE)ee4
-  pqtl_dir: dat/pqtl/ukb_ppp                                 # Path to dataset pQTLs
+  pqtl_dataset: wu_csf                                       # pQTL dataset ID (ukb-ppp or deCODE)ee4
+  pqtl_dir: dat/pqtl/wu_csf                                  # Path to dataset pQTLs
   ref_bfile: dat/ref/1000G_EUR_Phase3_plink/1000G.EUR.QC.ALL # Path to reference pannel (1,000 genomes)
+  run_smr: true                                              # Master on/off switch for the SMR step (after coloc)
+  bulk_eqtl_datasets: [eQTLGen, MetaBrain, GTEx_v10]         # Pre-computed bulk eQTL datasets under results/SMR/bulk/; [] = skip bulk SMR
+  sc_eqtl_dataset: SingleBrain                               # Single-cell eQTL dataset name under dat/sc-eQTL/; empty = skip sc SMR
   mediators: false                                           # True / False flag as to whether you want to include mediator analysis 
   mediator_manifest: assets/mediator_manifest.csv            # Path to mediator manifest outlining mediators
   maf: 0.01                                                  # Minor allele frequency cut-off in outcome GWAS
